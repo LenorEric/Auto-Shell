@@ -1,4 +1,4 @@
-# Auto shell
+# AI-Auto shell
 
 Lenor
 
