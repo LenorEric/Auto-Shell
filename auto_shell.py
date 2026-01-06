@@ -81,13 +81,13 @@ def detect_shell() -> Tuple[str, List[str]]:
 
 
 def run_command(
-    shell_name: str,
-    shell_prefix: List[str],
-    command: str,
-    timeout_seconds: int,
-    max_output_chars: int,
-    workdir: Optional[str],
-    extra_env: Dict[str, str],
+        shell_name: str,
+        shell_prefix: List[str],
+        command: str,
+        timeout_seconds: int,
+        max_output_chars: int,
+        workdir: Optional[str],
+        extra_env: Dict[str, str],
 ) -> Dict[str, Any]:
     cwd = workdir or os.getcwd()
     env = os.environ.copy()
@@ -166,16 +166,22 @@ def build_json_schema() -> Dict[str, Any]:
             "additionalProperties": False,
             "properties": {
                 "done": {"type": "boolean"},
-                "command": {"type": ["string", "null"], "description": "Exactly one shell command to run, or null if done=true."},
-                "shell": {"type": "string", "enum": ["bash", "powershell"], "description": "Which shell the command targets."},
+                "command": {"type": ["string", "null"],
+                            "description": "Exactly one shell command to run, or null if done=true."},
+                "shell": {"type": "string", "enum": ["bash", "powershell"],
+                          "description": "Which shell the command targets."},
                 "explanation": {"type": "string", "description": "Short explanation of why this command is next."},
-                "risk": {"type": "string", "enum": ["low", "medium", "high"], "description": "Risk level of this command."},
+                "risk": {"type": "string", "enum": ["low", "medium", "high"],
+                         "description": "Risk level of this command."},
                 "confirmation_prompt": {"type": "string", "description": "Prompt shown to the user before execution."},
                 "expected_outcome": {"type": "string", "description": "What success looks like for this step."},
-                "done_summary": {"type": ["string", "null"], "description": "If done=true, summarize what was accomplished."},
-                "next_goal_prompt": {"type": ["string", "null"], "description": "If done=true, ask user what to do next."},
+                "done_summary": {"type": ["string", "null"],
+                                 "description": "If done=true, summarize what was accomplished."},
+                "next_goal_prompt": {"type": ["string", "null"],
+                                     "description": "If done=true, ask user what to do next."},
             },
-            "required": ["done", "command", "shell", "explanation", "risk", "confirmation_prompt", "expected_outcome", "done_summary", "next_goal_prompt"],
+            "required": ["done", "command", "shell", "explanation", "risk", "confirmation_prompt", "expected_outcome",
+                         "done_summary", "next_goal_prompt"],
         },
     }
 
@@ -206,6 +212,10 @@ Hard rules:
 - If a step is risky (deletes data, changes system settings, modifies registry, formats disks, writes to system folders),
   set risk="high" and propose a safer alternative or ask for clarification in the explanation while STILL providing one command
   that gathers information instead of doing damage.
+- You may receive a JSON message of type "supplement" when the user skips a command and adds constraints.
+  Treat it as a high-priority update to the plan, and propose the next best single command accordingly.
+- If the user skips a command, do not insist on repeating it; adapt.
+
 - If you believe the task is complete, set done=true, command=null, and provide done_summary + next_goal_prompt.
 
 Interaction:
@@ -213,6 +223,21 @@ Interaction:
 - Use that feedback to decide the next command.
 
 Keep explanations brief.
+""".strip()
+
+
+def build_interjection_system_instructions(shell_name: str) -> str:
+    return f"""
+You are a command explainer for a user reviewing a proposed shell command.
+
+Context:
+- Shell: {shell_name}
+- The user will ask questions about the command’s meaning, risks, and what it changes.
+- Do NOT propose alternative commands.
+- Do NOT suggest multi-step plans.
+- Keep answers short, concrete, and focused on safety and effect.
+- Output in simple PLAIN text without markdown format because the interaction occurs in the terminal console.
+- If the command is dangerous or ambiguous, clearly state why and what to verify before running.
 """.strip()
 
 
@@ -233,11 +258,58 @@ def build_feedback_payload(exec_result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def build_supplement_payload(skipped_command: str, supplement: str) -> Dict[str, Any]:
+    return {
+        "type": "supplement",
+        "skipped_command": skipped_command,
+        "supplement": supplement,
+        "timestamp": int(time.time()),
+    }
+
+
+def interjection_qa(
+        client: OpenAI,
+        cfg: AppConfig,
+        shell_name: str,
+        command: str,
+) -> None:
+    """
+    Inline Q&A about a proposed command.
+    This does NOT modify the main goal conversation.
+    End by entering a single '.' (dot) on its own line.
+    """
+    print("\nASK MODE (end with a single '.' line)")
+    while True:
+        q = input("ASK> ").strip()
+        if q == ".":
+            print("Exit ASK MODE.\n")
+            return
+        if not q:
+            continue
+
+        temp_messages = [
+            {"role": "system", "content": build_interjection_system_instructions(shell_name)},
+            {"role": "user",
+             "content": json.dumps({"type": "proposed_command", "shell": shell_name, "command": command},
+                                   ensure_ascii=False)},
+            {"role": "user", "content": q},
+        ]
+
+        # Plain text reply is best here (no schema).
+        resp = client.responses.create(
+            model=cfg.model,
+            reasoning={"effort": cfg.reasoning_effort},
+            input=temp_messages,
+        )
+        answer = extract_output_text(resp).strip()
+        print(answer + "\n")
+
+
 def call_model(
-    client: OpenAI,
-    cfg: AppConfig,
-    messages: List[Dict[str, str]],
-    json_schema: Dict[str, Any],
+        client: OpenAI,
+        cfg: AppConfig,
+        messages: List[Dict[str, str]],
+        json_schema: Dict[str, Any],
 ) -> Dict[str, Any]:
     # Responses API with structured outputs in text.format. :contentReference[oaicite:4]{index=4}
     resp = client.responses.create(
@@ -261,24 +333,37 @@ def call_model(
 # UI / Loop
 # -----------------------------
 
-def prompt_yes_edit_skip(prompt: str) -> Tuple[str, Optional[str]]:
+def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     """
-    Returns: ("yes"|"edit"|"skip"|"quit", edited_command_if_any)
+    Returns:
+      ("run" | "edit" | "skip" | "ask" | "instruct", optional_text)
+
+    - edit: optional_text = edited command
+    - instruct: optional_text = supplementary instruction
     """
     print(prompt)
-    print("Confirm? [y]es / [e]dit / [s]kip / [q]uit")
+    print("Choose: [y]es(run) / [e]dit+run / [s]kip / [a]sk / [i]nstruct(skip+supplement)")
     while True:
         choice = input("> ").strip().lower()
+
         if choice in ("y", "yes"):
-            return ("yes", None)
+            return ("run", None)
+
         if choice in ("e", "edit"):
             new_cmd = input("Enter edited command:\n> ")
             return ("edit", new_cmd)
+
         if choice in ("s", "skip"):
             return ("skip", None)
-        if choice in ("q", "quit"):
-            return ("quit", None)
-        print("Invalid input. Use y/e/s/q.")
+
+        if choice in ("a", "ask"):
+            return ("ask", None)
+
+        if choice in ("i", "instruct"):
+            supp = input("Supplementary instruction for the model (why skip / what to do instead):\n> ")
+            return ("instruct", supp)
+
+        print("Invalid input. Use y/e/s/a/i.")
 
 
 def main() -> int:
@@ -364,23 +449,56 @@ def main() -> int:
 
             # Present to user
             print("\n\n**********\nNEXT STEP")
-            print(f"Explanation: {step.get('explanation','')}")
-            print(f"Risk: {step.get('risk','low')}")
-            print(f"Expected outcome: {step.get('expected_outcome','')}")
+            print(f"Explanation: {step.get('explanation', '')}")
+            print(f"Risk: {step.get('risk', 'low')}")
+            print(f"Expected outcome: {step.get('expected_outcome', '')}")
             print(f"\nCommand:\n{cmd}\n")
 
-            action, edited = prompt_yes_edit_skip(step.get("confirmation_prompt", "Run this command?"))
-            if action == "quit":
-                return 0
-            if action == "skip":
-                messages.append({"role": "user", "content": json.dumps({
-                    "type": "user_skipped",
-                    "skipped_command": cmd,
-                    "reason": "user_selected_skip",
-                }, ensure_ascii=False)})
-                continue
+            # --- replace the old action handling block with this ---
 
-            final_cmd = edited if action == "edit" else cmd
+            skip_current_step = False
+            final_cmd = ""
+            while True:
+                action, payload = prompt_action(step.get("confirmation_prompt", "Run this command?"))
+
+                if action == "ask":
+                    interjection_qa(client, cfg, shell_name, cmd)
+                    # IMPORTANT: do NOT attempt to interpret payload; just loop and prompt again.
+                    continue
+
+                if action == "skip":
+                    messages.append({"role": "user", "content": json.dumps({
+                        "type": "user_skipped",
+                        "skipped_command": cmd,
+                        "reason": "user_selected_skip",
+                    }, ensure_ascii=False)})
+                    # skip this command and request next model step
+                    skip_current_step = True
+                    break
+
+                if action == "instruct":
+                    supplement = (payload or "").strip()
+                    messages.append({"role": "user", "content": json.dumps(
+                        build_supplement_payload(cmd, supplement),
+                        ensure_ascii=False
+                    )})
+                    # skip this command and request next model step (with supplement)
+                    skip_current_step = True
+                    break
+
+                if action == "run":
+                    final_cmd = cmd
+                    skip_current_step = False
+                    break
+
+                if action == "edit":
+                    final_cmd = (payload or cmd)
+                    skip_current_step = False
+                    break
+
+            # After the loop:
+            if skip_current_step:
+                continue
 
             # Run
             exec_result = run_command(
@@ -399,7 +517,8 @@ def main() -> int:
 
             # Send feedback to model
             messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
-            messages.append({"role": "user", "content": json.dumps(build_feedback_payload(exec_result), ensure_ascii=False)})
+            messages.append(
+                {"role": "user", "content": json.dumps(build_feedback_payload(exec_result), ensure_ascii=False)})
 
     return 0
 
