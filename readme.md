@@ -8,6 +8,8 @@ Lenor
 python ./auto_shell.py config.yml
 ```
 
+Verified on Python 3.14
+
 When the prompt is `goal`, enter in natural language what you want to do.
 
 The console will first output the command to be executed, the command analysis, and the risk level, and will provide the reasons for doing so.

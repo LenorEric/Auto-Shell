@@ -3,9 +3,6 @@
 Requires:
   pip install openai pyyaml
 """
-
-from __future__ import annotations
-
 import json
 import os
 import platform
@@ -336,14 +333,6 @@ def call_model(
 # -----------------------------
 # UI / Loop
 # -----------------------------
-def _clip_text(s: str, limit: int) -> str:
-    if s is None:
-        return ""
-    if len(s) <= limit:
-        return s
-    return s[:limit] + "\n...[truncated]"
-
-
 def format_shell_text(s: str) -> str:
     """
     If s contains literal backslash-n sequences (\\n) instead of real newlines,
@@ -394,6 +383,13 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
 
 
 def main() -> int:
+    def _clip_text(s: str, limit: int) -> str:
+        if s is None:
+            return ""
+        if len(s) <= limit:
+            return s
+        return s[:limit] + "\n...[truncated]"
+
     if len(sys.argv) < 2:
         print("Usage: python smart_shell_agent.py path/to/config.yml")
         return 2
