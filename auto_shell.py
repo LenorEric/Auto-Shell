@@ -33,6 +33,7 @@ class AppConfig:
     reasoning_effort: str
     timeout_seconds: int
     max_output_chars: int
+    exec_preview_chars: int
     workdir: Optional[str]
     env: Dict[str, str]
     denylist_regex: List[str]
@@ -57,7 +58,8 @@ def load_config(path: str) -> AppConfig:
         model=openai_cfg.get("model", "gpt-5-chat-latest"),
         reasoning_effort=openai_cfg.get("reasoning_effort", "low"),
         timeout_seconds=int(agent_cfg.get("timeout_seconds", 30)),
-        max_output_chars=int(agent_cfg.get("max_output_chars", 12000)),
+        max_output_chars=int(agent_cfg.get("max_output_chars", 8192)),
+        exec_preview_chars=int(agent_cfg.get("exec_preview_chars", 2048)),
         workdir=agent_cfg.get("workdir"),
         env={str(k): str(v) for k, v in (agent_cfg.get("env", {}) or {}).items()},
         denylist_regex=list(safety_cfg.get("denylist_regex", []) or []),
@@ -170,10 +172,12 @@ def build_json_schema() -> Dict[str, Any]:
                             "description": "Exactly one shell command to run, or null if done=true."},
                 "shell": {"type": "string", "enum": ["bash", "powershell"],
                           "description": "Which shell the command targets."},
-                "explanation": {"type": "string", "description": "Short explanation of why this command is next."},
+                "explanation": {"type": "string",
+                                "description": "Analyze this command and its parameters from a technical perspective, and briefly explain its function."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
-                         "description": "Risk level of this command."},
-                "confirmation_prompt": {"type": "string", "description": "Prompt shown to the user before execution."},
+                         "description": "Risk level of current command to be run(just focus on the current one, not the global intention)."},
+                "confirmation_prompt": {"type": "string",
+                                        "description": "Before the user decides whether to execute it, explain to the user the overall effect of this command and the reason for doing so."},
                 "expected_outcome": {"type": "string", "description": "What success looks like for this step."},
                 "done_summary": {"type": ["string", "null"],
                                  "description": "If done=true, summarize what was accomplished."},
@@ -209,9 +213,9 @@ Hard rules:
 - Propose EXACTLY ONE command per step when done=false.
 - The command MUST target the user's shell: "{shell_name}" only.
 - Prefer safe, read-only inspection commands first.
-- If a step is risky (deletes data, changes system settings, modifies registry, formats disks, writes to system folders),
-  set risk="high" and propose a safer alternative or ask for clarification in the explanation while STILL providing one command
-  that gathers information instead of doing damage.
+- If current step is risky (deletes data, changes system settings, modifies registry, formats disks, writes to system folders),
+  set risk="high" and suggest user another alternative command in the confirmation_prompt. 
+  Notice that risk level only refers to the current command, not the overall goal.
 - You may receive a JSON message of type "supplement" when the user skips a command and adds constraints.
   Treat it as a high-priority update to the plan, and propose the next best single command accordingly.
 - If the user skips a command, do not insist on repeating it; adapt.
@@ -332,6 +336,29 @@ def call_model(
 # -----------------------------
 # UI / Loop
 # -----------------------------
+def _clip_text(s: str, limit: int) -> str:
+    if s is None:
+        return ""
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n...[truncated]"
+
+
+def format_shell_text(s: str) -> str:
+    """
+    If s contains literal backslash-n sequences (\\n) instead of real newlines,
+    convert them. Also normalize CRLF.
+    """
+    if not s:
+        return ""
+    # Convert literal "\n" to actual newline only if it looks like it was escaped.
+    # This avoids double-transforming already-normal text.
+    if "\\n" in s and "\n" not in s:
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    # Normalize actual CRLF to LF for consistent console output
+    s = s.replace("\r\n", "\n")
+    return s
+
 
 def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     """
@@ -342,7 +369,7 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     - instruct: optional_text = supplementary instruction
     """
     print(prompt)
-    print("Choose: [y]es(run) / [e]dit+run / [s]kip / [a]sk / [i]nstruct(skip+supplement)")
+    print("Choose: [y]es(run) / [e]dit+run / [s]kip / [a]sk / [i]nstruct")
     while True:
         choice = input("> ").strip().lower()
 
@@ -389,6 +416,8 @@ def main() -> int:
         if not goal:
             break
 
+        step_cnt = 0
+
         # Conversation for this goal
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": build_system_instructions(shell_name)},
@@ -397,13 +426,14 @@ def main() -> int:
 
         while True:
             step = call_model(client, cfg, messages, schema)
+            step_cnt += 1
 
             if cfg.show_raw_model_json:
                 print("\n[Model JSON]")
                 print(json.dumps(step, indent=2, ensure_ascii=False))
 
             # Done?
-            if step.get("done") is True:
+            if step.get("done"):
                 print("\nDONE")
                 if step.get("done_summary"):
                     print(step["done_summary"])
@@ -448,11 +478,11 @@ def main() -> int:
                 continue
 
             # Present to user
-            print("\n\n**********\nNEXT STEP")
-            print(f"Explanation: {step.get('explanation', '')}")
-            print(f"Risk: {step.get('risk', 'low')}")
-            print(f"Expected outcome: {step.get('expected_outcome', '')}")
+            print(f"\n\n**********\nSTEP {step_cnt}")
             print(f"\nCommand:\n{cmd}\n")
+            print(f"Explanation: {step.get('explanation', '')}")
+            print(f"Expected outcome: {step.get('expected_outcome', '')}")
+            print(f"Risk: {step.get('risk', 'UNKNOWN')}\n")
 
             # --- replace the old action handling block with this ---
 
@@ -512,8 +542,27 @@ def main() -> int:
             )
 
             # Show result to console
+            preview_limit = getattr(cfg, "exec_preview_chars", 512)
+
+            stdout_text = _clip_text(format_shell_text(exec_result.get("stdout", "") or ""), preview_limit)
+            stderr_text = _clip_text(format_shell_text(exec_result.get("stderr", "") or ""), preview_limit)
+
             print("\n[EXEC RESULT]")
-            print(json.dumps(exec_result, indent=2, ensure_ascii=False))
+            print(f"shell: {exec_result.get('shell')}")
+            print(f"cwd: {exec_result.get('cwd')}")
+            print(f"exit_code: {exec_result.get('exit_code')}")
+            print(f"timed_out: {exec_result.get('timed_out')}")
+            print(f"elapsed_seconds: {exec_result.get('elapsed_seconds')}")
+
+            print("\n[STDOUT]")
+            if stdout_text:
+                print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+            else:
+                print("(empty)")
+
+            if stderr_text:
+                print("\n[STDERR]")
+                print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
 
             # Send feedback to model
             messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
