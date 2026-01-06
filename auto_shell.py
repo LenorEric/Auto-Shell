@@ -363,7 +363,7 @@ def main() -> int:
                 continue
 
             # Present to user
-            print("\nNEXT STEP")
+            print("\n\n**********\nNEXT STEP")
             print(f"Explanation: {step.get('explanation','')}")
             print(f"Risk: {step.get('risk','low')}")
             print(f"Expected outcome: {step.get('expected_outcome','')}")
