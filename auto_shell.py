@@ -356,8 +356,6 @@ def interjection_qa(
     This does NOT modify the main goal conversation.
     End by entering a single '.' (dot) on its own line.
     """
-    print("\nASK MODE (end with a single '.' line)")
-
     context_messages = context[1:]
 
     temp_messages = [
@@ -370,9 +368,10 @@ def interjection_qa(
                                ensure_ascii=False)}
     ]
 
+    print("\nASK MODE ( (empty line to exit))")
     while True:
         q = input("ASK> ").strip()
-        if q == ".":
+        if not q:
             print("Exit ASK MODE.\n")
             return
         if not q:
