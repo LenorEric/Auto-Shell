@@ -603,7 +603,7 @@ def replay_console_history(messages: List[Dict[str, str]]) -> None:
                     print(f"Reason: {payload.get('reason')}")
 
 
-def auto_select_model(client: OpenAI, goal: str) -> str:
+def auto_select_model(client: OpenAI, goal: str) -> tuple[str, str]:
     router_model = "gpt-4.1-mini"
 
     model_map = {
@@ -672,7 +672,9 @@ def auto_select_model(client: OpenAI, goal: str) -> str:
     try:
         result = json.loads(output_text)
         complexity = result.get("complexity")
+        reason = result.get("reason", "")
     except json.JSONDecodeError as e:
+        reason = ""
         print(output_text)
         print("[WARN] Router output parse failed; escalated to large model.", e)
         complexity = "large"
@@ -681,7 +683,7 @@ def auto_select_model(client: OpenAI, goal: str) -> str:
         print("[WARN] Router output parse failed; escalated to large model.")
         complexity = "large"
 
-    return model_map[complexity]
+    return model_map[complexity], reason
 
 
 def main() -> int:
@@ -1019,8 +1021,9 @@ def main() -> int:
 
             step_cnt = 0
             if cfg.model.lower() == "auto":
-                cfg.selected_model = auto_select_model(client, goal)
-                print(f"\nUsing auto-selected model: {cfg.selected_model}\n")
+                cfg.selected_model, reason = auto_select_model(client, goal)
+                print(f"\nUsing auto-selected model: {cfg.selected_model}")
+                print(f"Router Reason: {reason}\n")
             else:
                 cfg.selected_model = cfg.model
 
