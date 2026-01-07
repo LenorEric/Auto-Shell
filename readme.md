@@ -20,7 +20,7 @@ After that, the user can choose to execute the command `[y]`, edit the command`[
 
 Asking Question in English is recommended since the prompt is based on English.
 
-This program is specialized for the ChatGPT API and tested based on ChatGPT 5.2; using other APIs may result in compatibility issues.
+This program is specialized for the ChatGPT API and tested based on ChatGPT 5.2; using other models may result in compatibility issues.
 
 ## Frequently Asked Questions
 

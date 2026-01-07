@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 from openai import OpenAI
+from openai.types.shared_params import Reasoning
 
 
 def load_config(path: str):
@@ -24,21 +25,43 @@ def load_config(path: str):
     api_key = openai_cfg.get("api_key")
     base_url = openai_cfg.get("base_url")
     model = openai_cfg.get("model")
+    effort = openai_cfg.get("reasoning_effort")
 
     if not api_key:
         raise ValueError("api_key missing in config")
     if not model:
         raise ValueError("model missing in config")
 
-    return api_key, base_url, model
+    print(f"api_key: {api_key}")
+    print(f"base_url: {base_url}")
+    print(f"model: {model}")
+    print(f"effort: {effort}")
 
+    return api_key, base_url, model, effort
+
+def eval_reasoning_effort(effort: str) -> Reasoning:
+    effort_lower = effort.lower()
+    if effort_lower == "none":
+        return Reasoning(effort="none")
+    elif effort_lower == "minimal":
+        return Reasoning(effort="minimal")
+    elif effort_lower == "low":
+        return Reasoning(effort="low")
+    elif effort_lower == "medium":
+        return Reasoning(effort="medium")
+    elif effort_lower == "high":
+        return Reasoning(effort="high")
+    elif effort_lower == "xhigh":
+        return Reasoning(effort="xhigh")
+    else:
+        return Reasoning(effort="low")  # Default to low if unrecognized
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python test_openai_config.py config.yml")
         sys.exit(1)
 
-    api_key, base_url, model = load_config(sys.argv[1])
+    api_key, base_url, model, reasoning_effort = load_config(sys.argv[1])
 
     client_kwargs = {"api_key": api_key}
     if base_url:
@@ -92,6 +115,7 @@ def main():
                 "schema": schema["schema"],
             }
         },
+        reasoning=eval_reasoning_effort(reasoning_effort),
     )
 
     # Extract structured output
