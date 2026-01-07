@@ -19,30 +19,3 @@ agent:
   env: {}
   # If true, prints the model JSON each step
   show_raw_model_json: false
-
-safety:
-  # Block commands matching any regex (case-insensitive).
-  # Tune to your risk tolerance.
-  denylist_regex:
-    # Destructive deletes (Linux/macOS)
-    - '(^|\\s)rm\\s+-rf\\s+(/|~|\\$HOME)\\b'
-    - '(^|\\s)mkfs\\b|(^|\\s)dd\\s+if='
-    # Windows destructive
-    - '(^|\\s)format\\b'
-    - '(^|\\s)diskpart\\b'
-    - '(^|\\s)Remove-Item\\b.*-Recurse\\b.*-Force\\b'
-    # Registry edits (often risky)
-    - '(^|\\s)reg\\s+add\\b|(^|\\s)reg\\s+delete\\b'
-
-  # If require_allowlist=true, ONLY commands that start with one of these prefixes can run.
-  require_allowlist: false
-  allowlist_prefixes:
-    # Examples (keep short; prefixes are matched literally)
-    - "ls"
-    - "pwd"
-    - "cat "
-    - "grep "
-    - "find "
-    - "Get-ChildItem"
-    - "Get-Content"
-    - "Select-String"

@@ -13,7 +13,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
 from openai import OpenAI
@@ -36,9 +36,6 @@ class AppConfig:
     compress_for_llm: bool
     workdir: Optional[str]
     env: Dict[str, str]
-    denylist_regex: List[str]
-    allowlist_prefixes: List[str]
-    require_allowlist: bool
     show_raw_model_json: bool
 
 
@@ -46,7 +43,6 @@ def load_config(path: str) -> AppConfig:
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     openai_cfg = data.get("openai", {})
     agent_cfg = data.get("agent", {})
-    safety_cfg = data.get("safety", {})
 
     api_key = openai_cfg.get("api_key") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -60,12 +56,9 @@ def load_config(path: str) -> AppConfig:
         timeout_seconds=int(agent_cfg.get("timeout_seconds", 30)),
         max_output_chars=int(agent_cfg.get("max_output_chars", 8192)),
         exec_preview_chars=int(agent_cfg.get("exec_preview_chars", 2048)),
-        compress_for_llm=bool(safety_cfg.get("compress_for_llm", True)),
+        compress_for_llm=bool(agent_cfg.get("compress_for_llm", True)),
         workdir=agent_cfg.get("workdir"),
         env={str(k): str(v) for k, v in (agent_cfg.get("env", {}) or {}).items()},
-        denylist_regex=list(safety_cfg.get("denylist_regex", []) or []),
-        allowlist_prefixes=list(safety_cfg.get("allowlist_prefixes", []) or []),
-        require_allowlist=bool(safety_cfg.get("require_allowlist", False)),
         show_raw_model_json=bool(agent_cfg.get("show_raw_model_json", False)),
     )
 
@@ -204,8 +197,50 @@ def extract_output_text(resp: Any) -> str:
 
 
 def parse_step_json(raw_text: str) -> Dict[str, Any]:
-    # With structured outputs, raw_text should be JSON.
-    return json.loads(raw_text)
+    def extract_first_json(text: str) -> str | None:
+        start = text.find('{')
+        if start == -1:
+            return None
+
+        brace_count = 0
+        in_string = False
+        escape = False
+
+        for i in range(start, len(text)):
+            char = text[i]
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == '\\':
+                    escape = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        return text[start:i + 1]
+
+        return None
+
+    try:
+        return json.loads(raw_text)
+    except Exception:
+        try:
+            fixed_text = extract_first_json(raw_text)
+            if fixed_text:
+                loaded = json.loads(fixed_text)
+                print("[WARN] Error occurred when parsing model output as JSON, but successfully extracted JSON portion.")
+                return loaded
+        except Exception:
+            print("[ERROR] Failed to parse model output as JSON. Raw output:")
+            print(raw_text)
+            return {}
 
 
 def build_system_instructions(shell_name: str) -> str:
@@ -215,7 +250,7 @@ You are SmartShell, an assistant that completes a user's goal by proposing ONE a
 Hard rules:
 - Output MUST be valid JSON matching the provided schema (no markdown, no extra keys).
 - Propose EXACTLY ONE action per step by setting cmd_type to "shell", "python", "query", or "done".
-- If the goal is vague or ambiguous (no need to double-check the clearly stated goal even if it's dangerous), or require user external operation, set cmd_type="query" and put your question in the "operation" field. Set risk=null, explanation=null, expected_outcome=null.
+- If the goal is vague or ambiguous (no need to double-check the clearly stated goal even if it's dangerous), or require user external operation (like asking for reboot), set cmd_type="query" and put your question in the "operation" field. Set risk=null, explanation=null, expected_outcome=null.
 - Shell commands MUST target the user's shell: "{shell_name}" only.
 - Shell should be used first, but if a Python script is more suitable, set cmd_type="python" and provide a concise and efficient Python code. (no comments needed in the script).
 - The Python code MUST be compatible with Python version {platform.python_version()}.
@@ -226,6 +261,7 @@ Hard rules:
 - If a "shell" or "python" step is risky (deletes data, changes settings, modifies registry and so on), set risk="high" and suggest an alternative in the conclusion_prompt. Risk level refers only to the current command.
 - You may receive a JSON "supplement" when the user adds constraints. Treat it as a high-priority update and adapt the next step.
 - If the user rejects a command, do not insist on repeating it; adapt and try another way.
+- If reboot (or leave) is needed, ask the user via a "query" step, don't directly reboot.
 - If the task is complete, set cmd_type="done", operation=null, and provide done_summary.
 
 Interaction:
@@ -253,7 +289,7 @@ Context:
 
 def build_user_payload(goal: str, shell_name: str) -> Dict[str, Any]:
     return {
-        "type": "goal",
+        "act_type": "goal",
         "goal": goal,
         "shell": shell_name,
         "python_version": platform.python_version(),
@@ -266,7 +302,7 @@ def build_cmd_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> D
         exec_result["stdout"] = compress_for_llm(exec_result.get("stdout", ""))
         exec_result["stderr"] = compress_for_llm(exec_result.get("stderr", ""))
     return {
-        "type": "command_result",
+        "act_type": "command_result",
         "result": exec_result,
         "timestamp": int(time.time()),
     }
@@ -274,15 +310,14 @@ def build_cmd_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> D
 
 def build_query_feedback_payload(answer: str) -> Dict[str, Any]:
     return {
-        "type": "query_answer",
+        "act_type": "query_answer",
         "answer": answer,
     }
 
 
-def build_supplement_payload(rejected_command: str, supplement: str) -> Dict[str, Any]:
+def build_supplement_payload(supplement: str) -> Dict[str, Any]:
     return {
-        "type": "supplement",
-        "rejected_command": rejected_command,
+        "act_type": "supplement",
         "supplement": supplement,
         "timestamp": int(time.time()),
     }
@@ -328,7 +363,7 @@ def interjection_qa(
         {"role": "user",
          "content": "The above is the historical operation record; the following are the user's questions."},
         {"role": "user",
-         "content": json.dumps({"type": "proposed_command", "command": command},
+         "content": json.dumps({"act_type": "proposed_command", "command": command},
                                ensure_ascii=False)}
     ]
 
@@ -357,16 +392,21 @@ def call_model(
         messages: List[Dict[str, str]],
         json_schema: Dict[str, Any],
 ) -> Dict[str, Any]:
-    # Responses API with structured outputs in text.format. :contentReference[oaicite:4]{index=4}
-    resp = client.responses.create(
-        model=cfg.model,
-        reasoning=eval_reasoning_effort(cfg.reasoning_effort),
-        input=messages,
-        text={"format": {"type": "json_schema", "name": json_schema["name"], "strict": True,
-                         "schema": json_schema["schema"], }},
-    )
-    raw = extract_output_text(resp)
-    return parse_step_json(raw)
+    while True:
+        resp = client.responses.create(
+            model=cfg.model,
+            reasoning=eval_reasoning_effort(cfg.reasoning_effort),
+            input=messages,
+            text={"format": {"type": "json_schema", "name": json_schema["name"], "strict": True,
+                             "schema": json_schema["schema"]}},
+        )
+        raw = extract_output_text(resp)
+        parsed = parse_step_json(raw)
+        if parsed and "cmd_type" in parsed:
+            break
+        print("[WARNING] Model output missing required 'cmd_type'. Retrying after 3s...\n")
+        time.sleep(3)
+    return parsed
 
 
 # -----------------------------
@@ -397,7 +437,7 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     - instruct: optional_text = supplementary instruction
     """
     print(prompt)
-    print("Choose: [y]es(run) / [s]kip / [a]sk / [i]nstruct / [q]uit")
+    print("Choose: [y]es(run) / [r]eject / [a]sk / [i]nstruct / [q]uit")
     while True:
         choice = input("> ").strip().lower()
 
@@ -426,7 +466,135 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
         if choice in ("q", "quit", "exit"):
             return "quit", None
 
-        print("Invalid input. Use y/e/s/a/i.")
+        print("Invalid input. Use y/e/r/a/i.")
+
+
+def dump_history(
+        messages: Union[list, dict],
+        step_cnt: int,
+        path: Union[str, Path] = "history.json"
+) -> None:
+    data = {
+        "messages": messages,
+        "step_cnt": int(step_cnt),
+    }
+
+    path = Path(path)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_history(
+        path: Union[str, Path] = "history.json"
+) -> tuple[Union[list, dict], int]:
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    messages = data.get("messages")
+    step_cnt = int(data.get("step_cnt", 0))
+
+    return messages, step_cnt
+
+
+import json
+from typing import List, Dict, Any
+
+
+def replay_console_history(messages: List[Dict[str, str]]) -> None:
+    """
+    Rebuild and print historical console output from saved messages.
+    This does NOT execute commands; it only replays what was previously shown.
+    """
+
+    step_idx = 0
+    last_step = None
+
+    def _print_exec_result(result: Dict[str, Any]) -> None:
+        print("\n[EXEC RESULT]")
+        print(f"cwd: {result.get('cwd')}")
+        print(f"exit_code: {result.get('exit_code')}")
+        print(f"timed_out: {result.get('timed_out')}")
+        print(f"elapsed_seconds: {result.get('elapsed_seconds')}")
+
+        stdout = result.get("stdout") or ""
+        stderr = result.get("stderr") or ""
+
+        print("\n[STDOUT]")
+        if stdout:
+            print(stdout, end="" if stdout.endswith("\n") else "\n")
+        else:
+            print("(empty)")
+
+        if stderr:
+            print("\n[STDERR]")
+            print(stderr, end="" if stderr.endswith("\n") else "\n")
+
+    for msg in messages[:-1]:
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if not content:
+            continue
+
+        # Try JSON decode; skip plain text system messages
+        try:
+            payload = json.loads(content)
+        except Exception:
+            continue
+
+        # ---- Assistant step ----
+        if role == "assistant" and isinstance(payload, dict) and "cmd_type" in payload:
+            step_idx += 1
+
+            print(f"\n\n**********")
+            print(f"STEP {step_idx}")
+
+            cmd_type = payload.get("cmd_type")
+
+            if cmd_type == "shell":
+                print(f"\nCommand:\n{payload.get('operation')}\n")
+                print(f"Explanation: {payload.get('explanation')}")
+                print(f"Expected outcome: {payload.get('expected_outcome')}")
+                print(f"Risk: {payload.get('risk')}\n")
+
+            elif cmd_type == "python":
+                print(f"\nCommand:\n{payload.get('operation')}\n")
+                print(f"Explanation: {payload.get('explanation')}")
+                print(f"Expected outcome: {payload.get('expected_outcome')}")
+                print(f"Risk: {payload.get('risk')}\n")
+
+            elif cmd_type == "query":
+                print(f"\nQuery:\n{payload.get('operation')}\n")
+
+            elif cmd_type == "done":
+                if payload.get("done_summary"):
+                    print(payload["done_summary"])
+                print("DONE\n**********\n")
+
+        # ---- User feedback ----
+        elif role == "user" and isinstance(payload, dict) and "act_type" in payload:
+            ptype = payload.get("act_type")
+
+            if ptype == "goal":
+                print(f"\n\nGOAL> {payload.get('goal')}")
+
+            elif ptype == "command_result":
+                result = payload.get("result", {})
+                _print_exec_result(result)
+
+            elif ptype == "query_answer":
+                print(f"ANS> {payload.get('answer')}")
+
+            elif ptype == "supplement":
+                print("\n[SUPPLEMENT]")
+                print(payload.get("supplement"))
+
+            elif ptype == "user_rejected":
+                print("\n[USER REJECTED]")
+                print(payload.get("user_rejected"))
+                if payload.get("reason"):
+                    print(f"Reason: {payload.get('reason')}")
 
 
 def main() -> int:
@@ -505,29 +673,8 @@ def main() -> int:
                     "elapsed_seconds": round(elapsed, 3),
                 }
 
+        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
         cmd = step.get("operation") or "No valid cmd got from llm"
-
-        # Safety checks
-        denied_by = is_denied(cmd, cfg.denylist_regex)
-        allowed = is_allowed_by_prefix(cmd, cfg.allowlist_prefixes)
-        if denied_by or (cfg.require_allowlist and not allowed):
-            print("\nBLOCKED (safety policy)")
-            if denied_by:
-                print(f"- Matched denylist regex: {denied_by}")
-            if cfg.require_allowlist and not allowed:
-                print("- Not in allowlist prefixes")
-            print(f"Proposed command: {cmd}")
-
-            # Ask model for a safer inspection command
-            messages.append({"role": "user", "content": json.dumps({
-                "type": "safety_block",
-                "blocked_command": cmd,
-                "denylist_match": denied_by,
-                "require_allowlist": cfg.require_allowlist,
-                "allowlist_prefixes": cfg.allowlist_prefixes,
-                "instruction": "Provide a safer alternative command (prefer read-only inspection).",
-            }, ensure_ascii=False)})
-            return 1
 
         # Present to user
         print(f"\nCommand:\n{cmd}\n")
@@ -546,7 +693,7 @@ def main() -> int:
 
             if action == "reject":
                 messages.append({"role": "user", "content": json.dumps({
-                    "type": "user_rejected",
+                    "act_type": "user_rejected",
                     "user_rejected": cmd,
                     "reason": payload or "user rejected without reason",
                 }, ensure_ascii=False)})
@@ -555,12 +702,13 @@ def main() -> int:
                 break
 
             if action == "instruct":
+                final_cmd = cmd
                 supplement = (payload or "").strip()
                 messages.append({"role": "user", "content": json.dumps(
-                    build_supplement_payload(cmd, supplement),
+                    build_supplement_payload(supplement),
                     ensure_ascii=False
                 )})
-                _skip_lvl = 1
+                _skip_lvl = 0
                 break
 
             if action == "run":
@@ -614,7 +762,6 @@ def main() -> int:
             print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
 
         # Send feedback to model
-        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
         messages.append(
             {"role": "user",
              "content": json.dumps(build_cmd_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
@@ -652,6 +799,7 @@ def main() -> int:
                     },
                 }
 
+        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
         pyc = step.get("operation") or "No valid python code got from llm"
 
         # Present to user
@@ -668,7 +816,7 @@ def main() -> int:
                 continue
             if action == "reject":
                 messages.append({"role": "user", "content": json.dumps({
-                    "type": "user_rejected",
+                    "act_type": "user_rejected",
                     "user_rejected": pyc,
                     "reason": payload or "user rejected without reason",
                 }, ensure_ascii=False)})
@@ -677,7 +825,7 @@ def main() -> int:
             if action == "instruct":
                 supplement = (payload or "").strip()
                 messages.append({"role": "user", "content": json.dumps(
-                    build_supplement_payload(pyc, supplement),
+                    build_supplement_payload(supplement),
                     ensure_ascii=False
                 )})
                 _skip_lvl = 1
@@ -698,7 +846,6 @@ def main() -> int:
 
         exec_result = run_agent_code(pyc)
 
-        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
         messages.append(
             {"role": "user",
              "content": json.dumps(build_cmd_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
@@ -707,20 +854,35 @@ def main() -> int:
 
     def serve_query_cmd():
         qry = step.get("operation") or "No valid query got from llm"
+        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
 
         # Present query to user
         print(f"\nQuery:\n{qry}\n")
 
-        _skip_lvl = 0
+        dump_history(messages, step_cnt)
+
         answer = input("ANS> ")
 
-        # Send feedback to model
-        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
         messages.append(
             {"role": "user",
              "content": json.dumps(build_query_feedback_payload(answer), ensure_ascii=False)})
 
+        if hist_path.exists():
+            hist_path.unlink()
+
         return 0
+
+    def continue_query_cmd():
+        replay_console_history(messages)
+        print(f"\n\n**********\nSTEP {step_cnt}")
+        qry = json.loads(messages[-1]["content"]).get("operation") or "No valid query got from history"
+        print(f"\nQuery:\n{qry}\n")
+
+        answer = input("ANS> ")
+
+        messages.append(
+            {"role": "user",
+             "content": json.dumps(build_query_feedback_payload(answer), ensure_ascii=False)})
 
     if len(sys.argv) < 2:
         print("Usage: python smart_shell_agent.py path/to/config.yml")
@@ -732,6 +894,7 @@ def main() -> int:
         print("Some commands may fail due to insufficient permissions. You may want to elevate your privileges.\n")
     print(f"Shell detected: {shell_name}")
     print(f"Python version: {platform.python_version()}")
+    print()
 
     cfg = load_config(sys.argv[1])
 
@@ -742,22 +905,43 @@ def main() -> int:
 
     schema = build_json_schema()
 
-    print("Enter a goal (empty line to exit).")
+    # If a previous history exists, load it so the agent can resume
+    hist_path = Path("history.json")
+    messages = None
+    step_cnt = 0
+    use_hist = False
+    if hist_path.exists():
+        use_hist = True if input("Found existing history.json. Load it? [y/n]: ").strip().lower() == "y" else False
+        if use_hist:
+            try:
+                messages, step_cnt = load_history(hist_path)
+                print(f"Loaded history from `history.json` (step_cnt={step_cnt}).")
+            except Exception as e:
+                print(f"Failed to load history from `history.json`: {e}")
+        else:
+            print("Starting a new session.")
+        hist_path.unlink()
 
     while True:
-        goal = input("\nGOAL> ").strip()
-        if not goal:
-            break
+        if not use_hist:
+            print("Enter a goal (empty line to exit).")
+            goal = input("\nGOAL> ").strip()
+            if not goal:
+                break
 
-        step_cnt = 0
+            step_cnt = 0
 
-        # Conversation for this goal
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": build_system_instructions(shell_name)},
-            {"role": "user", "content": json.dumps(build_user_payload(goal, shell_name), ensure_ascii=False)},
-        ]
+            # Conversation for this goal
+            messages = [
+                {"role": "system", "content": build_system_instructions(shell_name)},
+                {"role": "user", "content": json.dumps(build_user_payload(goal, shell_name), ensure_ascii=False)},
+            ]
 
         while True:
+            if use_hist:
+                continue_query_cmd()
+                use_hist = False  # only load once at start
+
             step = call_model(client, cfg, messages, schema)
             step_cnt += 1
             print(f"\n\n**********\nSTEP {step_cnt}")
