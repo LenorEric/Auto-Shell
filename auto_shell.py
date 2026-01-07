@@ -358,26 +358,29 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     - instruct: optional_text = supplementary instruction
     """
     print(prompt)
-    print("Choose: [y]es(run) / [e]dit+run / [s]kip / [a]sk / [i]nstruct")
+    print("Choose: [y]es(run) / [e]dit+run / [s]kip / [a]sk / [i]nstruct / [q]uit")
     while True:
         choice = input("> ").strip().lower()
 
         if choice in ("y", "yes"):
-            return ("run", None)
+            return "run", None
 
         if choice in ("e", "edit"):
             new_cmd = input("Enter edited command:\n> ")
-            return ("edit", new_cmd)
+            return "edit", new_cmd
 
         if choice in ("s", "skip"):
-            return ("skip", None)
+            return "skip", None
 
         if choice in ("a", "ask"):
-            return ("ask", None)
+            return "ask", None
 
         if choice in ("i", "instruct"):
             supp = input("Supplementary instruction for the model (why skip / what to do instead):\n> ")
-            return ("instruct", supp)
+            return "instruct", supp
+
+        if choice in ("q", "quit", "exit"):
+            return "quit", None
 
         print("Invalid input. Use y/e/s/a/i.")
 
@@ -482,7 +485,7 @@ def main() -> int:
 
             # --- replace the old action handling block with this ---
 
-            skip_current_step = False
+            skip_level = False
             final_cmd = ""
             while True:
                 action, payload = prompt_action(step.get("confirmation_prompt", "Run this command?"))
@@ -499,7 +502,7 @@ def main() -> int:
                         "reason": "user_selected_skip",
                     }, ensure_ascii=False)})
                     # skip this command and request next model step
-                    skip_current_step = True
+                    skip_level = 1
                     break
 
                 if action == "instruct":
@@ -509,21 +512,27 @@ def main() -> int:
                         ensure_ascii=False
                     )})
                     # skip this command and request next model step (with supplement)
-                    skip_current_step = True
+                    skip_level = 1
                     break
 
                 if action == "run":
                     final_cmd = cmd
-                    skip_current_step = False
+                    skip_level = 0
                     break
 
                 if action == "edit":
                     final_cmd = (payload or cmd)
-                    skip_current_step = False
+                    skip_level = 0
+                    break
+
+                if action == "quit":
+                    skip_level = 2
                     break
 
             # After the loop:
-            if skip_current_step:
+            if skip_level == 2:
+                break
+            if skip_level == 1:
                 continue
 
             # Run
