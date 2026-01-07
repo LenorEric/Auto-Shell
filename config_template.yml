@@ -12,6 +12,7 @@ agent:
   timeout_seconds: 30
   max_output_chars: 8192
   exec_preview_chars: 2048
+  compress_for_llm: true
   # Optional fixed working directory (null means current directory)
   workdir: null
   # Extra env vars for commands

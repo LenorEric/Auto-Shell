@@ -31,6 +31,7 @@ class AppConfig:
     timeout_seconds: int
     max_output_chars: int
     exec_preview_chars: int
+    compress_for_llm: bool
     workdir: Optional[str]
     env: Dict[str, str]
     denylist_regex: List[str]
@@ -57,6 +58,7 @@ def load_config(path: str) -> AppConfig:
         timeout_seconds=int(agent_cfg.get("timeout_seconds", 30)),
         max_output_chars=int(agent_cfg.get("max_output_chars", 8192)),
         exec_preview_chars=int(agent_cfg.get("exec_preview_chars", 2048)),
+        compress_for_llm=bool(safety_cfg.get("compress_for_llm", True)),
         workdir=agent_cfg.get("workdir"),
         env={str(k): str(v) for k, v in (agent_cfg.get("env", {}) or {}).items()},
         denylist_regex=list(safety_cfg.get("denylist_regex", []) or []),
@@ -133,6 +135,64 @@ def run_command(
         }
 
 
+_RE_NBSP = re.compile(r"[\u00A0\u2007\u202F]")          # common non-breaking spaces
+_RE_HSPACE = re.compile(r"[ \t\u2000-\u200A\u205F]+")   # horizontal whitespace (space-like)
+_RE_TRAIL_SPACE = re.compile(r"[ \t]+(?=\r?\n)")        # trailing spaces before newline
+_RE_MANY_BLANKS = re.compile(r"(?:\r?\n){3,}")          # 3+ newlines
+
+def compress_for_llm(
+    s: Optional[str],
+    *,
+    keep_indentation: bool = True,
+    max_consecutive_blank_lines: int = 2,
+    strip_ends: bool = True,
+) -> str:
+    """
+    LLM-friendly whitespace compression:
+    - Normalizes NBSP-like chars to plain space
+    - Removes trailing spaces at line ends
+    - Collapses repeated horizontal whitespace inside lines
+      (optionally preserving leading indentation)
+    - Limits consecutive blank lines (default: 2)
+    """
+    if not s:
+        return ""
+
+    # Normalize line endings and NBSP-like spaces
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _RE_NBSP.sub(" ", s)
+
+    # Remove trailing spaces at end of lines
+    s = _RE_TRAIL_SPACE.sub("", s)
+
+    lines = s.split("\n")
+    out_lines = []
+
+    for line in lines:
+        if keep_indentation:
+            # Preserve leading indentation (spaces/tabs) exactly, compress the rest
+            m = re.match(r"^[ \t]+", line)
+            indent = m.group(0) if m else ""
+            rest = line[len(indent):]
+            rest = _RE_HSPACE.sub(" ", rest).strip(" ")
+            out_lines.append(indent + rest)
+        else:
+            # Compress all horizontal whitespace, then trim line edges
+            out_lines.append(_RE_HSPACE.sub(" ", line).strip(" "))
+
+    s = "\n".join(out_lines)
+
+    # Limit consecutive blank lines
+    if max_consecutive_blank_lines is not None:
+        n = max(0, int(max_consecutive_blank_lines))
+        s = re.sub(r"\n{" + str(n + 2) + r",}", "\n" * (n + 1), s)
+
+    if strip_ends:
+        s = s.strip()
+
+    return s
+
+
 # -----------------------------
 # Safety checks
 # -----------------------------
@@ -164,11 +224,10 @@ def build_json_schema() -> Dict[str, Any]:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "done": {"type": "boolean"},
+                "type": {"type": "string", "enum": ["done", "python", "shell", "query"],
+                         "description": "Current step type. If all works are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
                 "command": {"type": ["string", "null"],
-                            "description": "Exactly one shell command to run, or null if done=true."},
-                "shell": {"type": "string", "enum": ["bash", "powershell"],
-                          "description": "Which shell the command targets."},
+                            "description": "Exactly one shell command to run, or question that needs ensure from the user, or null if done=true."},
                 "explanation": {"type": "string",
                                 "description": "Analyze this command and its parameters from a technical perspective, and briefly explain its function."},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
@@ -181,7 +240,7 @@ def build_json_schema() -> Dict[str, Any]:
                 "next_goal_prompt": {"type": ["string", "null"],
                                      "description": "If done=true, ask user what to do next."},
             },
-            "required": ["done", "command", "shell", "explanation", "risk", "confirmation_prompt", "expected_outcome",
+            "required": ["type", "command", "explanation", "risk", "confirmation_prompt", "expected_outcome",
                          "done_summary", "next_goal_prompt"],
         },
     }
@@ -251,7 +310,10 @@ def build_user_payload(goal: str, shell_name: str) -> Dict[str, Any]:
     }
 
 
-def build_feedback_payload(exec_result: Dict[str, Any]) -> Dict[str, Any]:
+def build_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> Dict[str, Any]:
+    if compress:
+        exec_result["stdout"] = compress_for_llm(exec_result.get("stdout", ""))
+        exec_result["stderr"] = compress_for_llm(exec_result.get("stderr", ""))
     return {
         "type": "command_result",
         "result": exec_result,
@@ -453,7 +515,7 @@ def main() -> int:
                 print(json.dumps(step, indent=2, ensure_ascii=False))
 
             # Done?
-            if step.get("done"):
+            if step.get("type") == "done":
                 print("\nDONE")
                 if step.get("done_summary"):
                     print(step["done_summary"])
@@ -462,18 +524,6 @@ def main() -> int:
                 break
 
             cmd = step.get("command") or ""
-            target_shell = step.get("shell")
-
-            # Enforce shell match
-            if target_shell != shell_name:
-                print(f"\nModel proposed shell={target_shell}, but host shell={shell_name}. Blocking.")
-                messages.append({"role": "user", "content": json.dumps({
-                    "type": "policy_violation",
-                    "error": "shell_mismatch",
-                    "host_shell": shell_name,
-                    "model_shell": target_shell,
-                }, ensure_ascii=False)})
-                continue
 
             # Safety checks
             denied_by = is_denied(cmd, cfg.denylist_regex)
@@ -593,7 +643,7 @@ def main() -> int:
             # Send feedback to model
             messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
             messages.append(
-                {"role": "user", "content": json.dumps(build_feedback_payload(exec_result), ensure_ascii=False)})
+                {"role": "user", "content": json.dumps(build_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
 
     return 0
 
