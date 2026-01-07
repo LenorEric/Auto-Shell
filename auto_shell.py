@@ -378,7 +378,7 @@ def interjection_qa(
         temp_messages.append({"role": "user", "content": q})
         resp = client.responses.create(
             model=cfg.model,
-            reasoning=eval_reasoning_effort(cfg.reasoning_effort),
+            # reasoning=eval_reasoning_effort(cfg.reasoning_effort),
             input=temp_messages,
         )
         temp_messages.append({"role": "assistant", "content": extract_output_text(resp)})
@@ -395,7 +395,7 @@ def call_model(
     while True:
         resp = client.responses.create(
             model=cfg.model,
-            reasoning=eval_reasoning_effort(cfg.reasoning_effort),
+            # reasoning=eval_reasoning_effort(cfg.reasoning_effort),
             input=messages,
             text={"format": {"type": "json_schema", "name": json_schema["name"], "strict": True,
                              "schema": json_schema["schema"]}},

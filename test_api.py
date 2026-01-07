@@ -81,8 +81,9 @@ def main():
                 "model_family": {"type": "string"},
                 "provider": {"type": "string"},
                 "api_ok": {"type": "boolean"},
+                "miscellaneous": {"type": "string"},
             },
-            "required": ["model_name", "model_family", "provider", "api_ok"],
+            "required": ["model_name", "model_family", "provider", "api_ok", "miscellaneous"],
         },
     }
 
@@ -114,8 +115,7 @@ def main():
                 "strict": True,
                 "schema": schema["schema"],
             }
-        },
-        reasoning=eval_reasoning_effort(reasoning_effort),
+        }
     )
 
     # Extract structured output
