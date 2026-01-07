@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from openai import OpenAI
+from openai.types.shared_params import Reasoning
 
 
 # -----------------------------
@@ -66,6 +67,10 @@ def load_config(path: str) -> AppConfig:
         require_allowlist=bool(safety_cfg.get("require_allowlist", False)),
         show_raw_model_json=bool(agent_cfg.get("show_raw_model_json", False)),
     )
+
+
+def dump_list_dict_str(data: list[dict[str, str]]) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 # -----------------------------
@@ -135,17 +140,18 @@ def run_command(
         }
 
 
-_RE_NBSP = re.compile(r"[\u00A0\u2007\u202F]")          # common non-breaking spaces
-_RE_HSPACE = re.compile(r"[ \t\u2000-\u200A\u205F]+")   # horizontal whitespace (space-like)
-_RE_TRAIL_SPACE = re.compile(r"[ \t]+(?=\r?\n)")        # trailing spaces before newline
-_RE_MANY_BLANKS = re.compile(r"(?:\r?\n){3,}")          # 3+ newlines
+_RE_NBSP = re.compile(r"[\u00A0\u2007\u202F]")  # common non-breaking spaces
+_RE_HSPACE = re.compile(r"[ \t\u2000-\u200A\u205F]+")  # horizontal whitespace (space-like)
+_RE_TRAIL_SPACE = re.compile(r"[ \t]+(?=\r?\n)")  # trailing spaces before newline
+_RE_MANY_BLANKS = re.compile(r"(?:\r?\n){3,}")  # 3+ newlines
+
 
 def compress_for_llm(
-    s: Optional[str],
-    *,
-    keep_indentation: bool = True,
-    max_consecutive_blank_lines: int = 2,
-    strip_ends: bool = True,
+        s: Optional[str],
+        *,
+        keep_indentation: bool = True,
+        max_consecutive_blank_lines: int = 2,
+        strip_ends: bool = True,
 ) -> str:
     """
     LLM-friendly whitespace compression:
@@ -224,24 +230,24 @@ def build_json_schema() -> Dict[str, Any]:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "type": {"type": "string", "enum": ["done", "python", "shell", "query"],
+                "cmd_type": {"type": "string", "enum": ["done", "python", "shell", "query"],
                          "description": "Current step type. If all works are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
                 "command": {"type": ["string", "null"],
-                            "description": "Exactly one shell command to run, or question that needs ensure from the user, or null if done=true."},
+                            "description": "Exactly one shell command to be directly run if type=shell, or question that needs ensure from the user if type=query, or null if done=true. Multiple commands shall be joined with proper connector if necessary to save steps."},
+                "python_code" : {"type": ["string", "null"],
+                                    "description": "Python code snippet to be executed if type=python, or null otherwise."},
                 "explanation": {"type": "string",
-                                "description": "Analyze this command and its parameters from a technical perspective, and briefly explain its function."},
+                                "description": "Analyze this command and its parameters from a technical perspective, and briefly explain its function. Or null if type=query"},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
-                         "description": "Risk level of current command to be run(just focus on the current one, not the global intention)."},
-                "confirmation_prompt": {"type": "string",
-                                        "description": "Before the user decides whether to execute it, explain to the user the overall effect of this command and the reason for doing so."},
-                "expected_outcome": {"type": "string", "description": "What success looks like for this step."},
+                         "description": "Risk level of current command to be run(just focus on the current one, not the global intention). Or null if type=query"},
+                "conclusion_prompt": {"type": "string",
+                                        "description": "Before the user decides whether to execute it, explain to the user the overall effect of this command and the reason for doing so.  Or null if type=query"},
+                "expected_outcome": {"type": "string", "description": "What success console output looks like for this step's command. Or null if type=query"},
                 "done_summary": {"type": ["string", "null"],
-                                 "description": "If done=true, summarize what was accomplished."},
-                "next_goal_prompt": {"type": ["string", "null"],
-                                     "description": "If done=true, ask user what to do next."},
+                                 "description": "If done=true, summarize what was accomplished or give final answer."},
             },
-            "required": ["type", "command", "explanation", "risk", "confirmation_prompt", "expected_outcome",
-                         "done_summary", "next_goal_prompt"],
+            "required": ["cmd_type", "command", "python_code", "explanation", "risk", "conclusion_prompt", "expected_outcome",
+                         "done_summary"],
         },
     }
 
@@ -262,25 +268,23 @@ def parse_step_json(raw_text: str) -> Dict[str, Any]:
 
 def build_system_instructions(shell_name: str) -> str:
     return f"""
-You are SmartShell, an assistant that completes a user's goal by proposing ONE terminal command at a time.
+You are SmartShell, an assistant that completes a user's goal by proposing ONE action at a time (shell command, python script, or query).
 
 Hard rules:
 - Output MUST be valid JSON matching the provided schema (no markdown, no extra keys).
-- Propose EXACTLY ONE command per step when done=false.
-- The command MUST target the user's shell: "{shell_name}" only.
-- Prefer safe, read-only inspection commands first.
-- If current step is risky (deletes data, changes system settings, modifies registry, formats disks, writes to system folders),
-  set risk="high" and suggest user another alternative command in the confirmation_prompt. 
-  Notice that risk level only refers to the current command, not the overall goal.
-- You may receive a JSON message of type "supplement" when the user skips a command and adds constraints.
-  Treat it as a high-priority update to the plan, and propose the next best single command accordingly.
-- If the user skips a command, do not insist on repeating it; adapt.
-
-- If you believe the task is complete, set done=true, command=null, and provide done_summary + next_goal_prompt.
+- Propose EXACTLY ONE action per step by setting cmd_type to "shell", "python", "query", or "done".
+- If the goal is vague or requires clarification/choice, set cmd_type="query" and put your question in the "command" field. Set fields like risk, explanation, and expected_outcome to null.
+- If a Python script is more suitable than shell commands, set cmd_type="python" and provide the code in "python_code" (no comments needed in the script).
+- Shell commands MUST target the user's shell: "{shell_name}" only.
+- Prefer safe, read-only inspection commands.
+- If a "shell" or "python" step is risky (deletes data, changes settings, modifies registry and so on), set risk="high" and suggest an alternative in the conclusion_prompt. Risk level refers only to the current command.
+- You may receive a JSON "supplement" when the user adds constraints. Treat it as a high-priority update and adapt the next step.
+- If the user rejects a command, do not insist on repeating it; adapt and try another way.
+- If the task is complete, set cmd_type="done", command=null, and provide done_summary.
 
 Interaction:
-- You will receive JSON feedback about the last command's stdout/stderr/exit_code.
-- Use that feedback to decide the next command.
+- You will receive JSON feedback about the last command's stdout/stderr/exit_code (or python execution results) or user's answer.
+- Use that feedback to decide the next action.
 
 Keep explanations brief.
 """.strip()
@@ -321,13 +325,31 @@ def build_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> Dict[
     }
 
 
-def build_supplement_payload(skipped_command: str, supplement: str) -> Dict[str, Any]:
+def build_supplement_payload(rejected_command: str, supplement: str) -> Dict[str, Any]:
     return {
         "type": "supplement",
-        "skipped_command": skipped_command,
+        "rejected_command": rejected_command,
         "supplement": supplement,
         "timestamp": int(time.time()),
     }
+
+
+def eval_reasoning_effort(effort: str) -> Reasoning:
+    effort_lower = effort.lower()
+    if effort_lower == "none":
+        return Reasoning(effort="none")
+    elif effort_lower == "minimal":
+        return Reasoning(effort="minimal")
+    elif effort_lower == "low":
+        return Reasoning(effort="low")
+    elif effort_lower == "medium":
+        return Reasoning(effort="medium")
+    elif effort_lower == "high":
+        return Reasoning(effort="high")
+    elif effort_lower == "xhigh":
+        return Reasoning(effort="xhigh")
+    else:
+        return Reasoning(effort="low")  # Default to low if unrecognized
 
 
 def interjection_qa(
@@ -361,8 +383,8 @@ def interjection_qa(
         # Plain text reply is best here (no schema).
         resp = client.responses.create(
             model=cfg.model,
-            reasoning={"effort": cfg.reasoning_effort},
-            input=temp_messages,
+            reasoning=eval_reasoning_effort(cfg.reasoning_effort),
+            input=dump_list_dict_str(temp_messages),
         )
         answer = extract_output_text(resp).strip()
         print(answer + "\n")
@@ -377,16 +399,10 @@ def call_model(
     # Responses API with structured outputs in text.format. :contentReference[oaicite:4]{index=4}
     resp = client.responses.create(
         model=cfg.model,
-        reasoning={"effort": cfg.reasoning_effort},
-        input=messages,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": json_schema["name"],
-                "strict": True,
-                "schema": json_schema["schema"],
-            }
-        },
+        reasoning=eval_reasoning_effort(cfg.reasoning_effort),
+        input=dump_list_dict_str(messages),
+        text={"format": {"type": "json_schema", "name": json_schema["name"], "strict": True,
+                         "schema": json_schema["schema"], }},
     )
     raw = extract_output_text(resp)
     return parse_step_json(raw)
@@ -414,7 +430,7 @@ def format_shell_text(s: str) -> str:
 def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     """
     Returns:
-      ("run" | "edit" | "skip" | "ask" | "instruct", optional_text)
+      ("run" | "edit" | "reject" | "ask" | "instruct", optional_text)
 
     - edit: optional_text = edited command
     - instruct: optional_text = supplementary instruction
@@ -431,20 +447,23 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
             new_cmd = input("Enter edited command:\n> ")
             return "edit", new_cmd
 
-        if choice in ("s", "skip"):
-            return "skip", None
+        if choice in ("r", "reject"):
+            reason = input("Enter a reason (leave blank for no reason):\n> ")
+            return "reject", reason
 
         if choice in ("a", "ask"):
             return "ask", None
 
         if choice in ("i", "instruct"):
-            supp = input("Supplementary instruction for the model (why skip / what to do instead):\n> ")
+            supp = input("Supplementary instruction for the model:\n> ")
             return "instruct", supp
 
         if choice in ("q", "quit", "exit"):
             return "quit", None
 
         print("Invalid input. Use y/e/s/a/i.")
+
+
 
 
 def main() -> int:
@@ -473,6 +492,134 @@ def main() -> int:
             return s
         return s[:end_idx] + "\n...[truncated]"
 
+    def serve_shell_cmd():
+        cmd = step.get("command") or ""
+
+        # Safety checks
+        denied_by = is_denied(cmd, cfg.denylist_regex)
+        allowed = is_allowed_by_prefix(cmd, cfg.allowlist_prefixes)
+        if denied_by or (cfg.require_allowlist and not allowed):
+            print("\nBLOCKED (safety policy)")
+            if denied_by:
+                print(f"- Matched denylist regex: {denied_by}")
+            if cfg.require_allowlist and not allowed:
+                print("- Not in allowlist prefixes")
+            print(f"Proposed command: {cmd}")
+
+            # Ask model for a safer inspection command
+            messages.append({"role": "user", "content": json.dumps({
+                "type": "safety_block",
+                "blocked_command": cmd,
+                "denylist_match": denied_by,
+                "require_allowlist": cfg.require_allowlist,
+                "allowlist_prefixes": cfg.allowlist_prefixes,
+                "instruction": "Provide a safer alternative command (prefer read-only inspection).",
+            }, ensure_ascii=False)})
+            return 1
+
+        # Present to user
+        print(f"\nCommand:\n{cmd}\n")
+        print(f"Explanation: {step.get('explanation', '')}")
+        print(f"Expected outcome: {step.get('expected_outcome', '')}")
+        print(f"Risk: {step.get('risk', 'UNKNOWN')}\n")
+
+        # --- replace the old action handling block with this ---
+
+        _skip_lvl = 0
+        final_cmd = ""
+        while True:
+            action, payload = prompt_action(step.get("conclusion_prompt", "Run this command?"))
+
+            if action == "ask":
+                interjection_qa(client, cfg, shell_name, cmd)
+                # IMPORTANT: do NOT attempt to interpret payload; just loop and prompt again.
+                continue
+
+            if action == "reject":
+                messages.append({"role": "user", "content": json.dumps({
+                    "type": "user_rejected",
+                    "user_rejected": cmd,
+                    "reason": payload or "user rejected without reason",
+                }, ensure_ascii=False)})
+                # skip this command and request next model step
+                _skip_lvl = 1
+                break
+
+            if action == "instruct":
+                supplement = (payload or "").strip()
+                messages.append({"role": "user", "content": json.dumps(
+                    build_supplement_payload(cmd, supplement),
+                    ensure_ascii=False
+                )})
+                # skip this command and request next model step (with supplement)
+                _skip_lvl = 1
+                break
+
+            if action == "run":
+                final_cmd = cmd
+                _skip_lvl = 0
+                break
+
+            if action == "edit":
+                final_cmd = (payload or cmd)
+                _skip_lvl = 0
+                break
+
+            if action == "quit":
+                _skip_lvl = 2
+                break
+
+        # After the loop:
+        if _skip_lvl:
+            return _skip_lvl
+
+        # Run
+        exec_result = run_command(
+            shell_name=shell_name,
+            shell_prefix=shell_prefix,
+            command=final_cmd,
+            timeout_seconds=cfg.timeout_seconds,
+            max_output_chars=cfg.max_output_chars,
+            workdir=cfg.workdir,
+            extra_env=cfg.env,
+        )
+
+        # Show result to console
+        preview_limit = cfg.exec_preview_chars
+
+        stdout_text = clip_text(format_shell_text(exec_result.get("stdout", "") or ""), preview_limit)
+        stderr_text = clip_text(format_shell_text(exec_result.get("stderr", "") or ""), preview_limit)
+
+        print("\n[EXEC RESULT]")
+        print(f"cwd: {exec_result.get('cwd')}")
+        print(f"exit_code: {exec_result.get('exit_code')}")
+        print(f"timed_out: {exec_result.get('timed_out')}")
+        print(f"elapsed_seconds: {exec_result.get('elapsed_seconds')}")
+
+        print("\n[STDOUT]")
+        if stdout_text:
+            print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
+        else:
+            print("(empty)")
+
+        if stderr_text:
+            print("\n[STDERR]")
+            print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
+
+        # Send feedback to model
+        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
+        messages.append(
+            {"role": "user",
+             "content": json.dumps(build_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
+
+        return 0
+
+    def serve_python_cmd():
+        return 0
+
+    def serve_query_cmd():
+        return 0
+
     if len(sys.argv) < 2:
         print("Usage: python smart_shell_agent.py path/to/config.yml")
         return 2
@@ -487,7 +634,7 @@ def main() -> int:
     shell_name, shell_prefix = detect_shell()
     schema = build_json_schema()
 
-    if not(is_admin()):
+    if not (is_admin()):
         print("WARNING: The agent is NOT running with administrative/root privileges.")
         print("Some commands may fail due to insufficient permissions. You may want to elevate your privileges.\n")
     print(f"Shell detected: {shell_name}")
@@ -509,141 +656,30 @@ def main() -> int:
         while True:
             step = call_model(client, cfg, messages, schema)
             step_cnt += 1
+            print(f"\n\n**********\nSTEP {step_cnt}")
 
             if cfg.show_raw_model_json:
                 print("\n[Model JSON]")
                 print(json.dumps(step, indent=2, ensure_ascii=False))
 
+            skip_lvl = 0
+
             # Done?
-            if step.get("type") == "done":
+            if step.get("cmd_type") == "done":
                 print("\nDONE")
                 if step.get("done_summary"):
                     print(step["done_summary"])
-                if step.get("next_goal_prompt"):
-                    print(step["next_goal_prompt"])
+                skip_lvl = 2
+            elif step.get("cmd_type") == "shell":
+                skip_lvl = serve_shell_cmd()
+            elif step.get("cmd_type") == "python":
+                skip_lvl = serve_python_cmd()
+            elif step.get("cmd_type") == "query":
+                skip_lvl = serve_query_cmd()
+
+            if skip_lvl == 2:
                 break
 
-            cmd = step.get("command") or ""
-
-            # Safety checks
-            denied_by = is_denied(cmd, cfg.denylist_regex)
-            allowed = is_allowed_by_prefix(cmd, cfg.allowlist_prefixes)
-            if denied_by or (cfg.require_allowlist and not allowed):
-                print("\nBLOCKED (safety policy)")
-                if denied_by:
-                    print(f"- Matched denylist regex: {denied_by}")
-                if cfg.require_allowlist and not allowed:
-                    print("- Not in allowlist prefixes")
-                print(f"Proposed command: {cmd}")
-
-                # Ask model for a safer inspection command
-                messages.append({"role": "user", "content": json.dumps({
-                    "type": "safety_block",
-                    "blocked_command": cmd,
-                    "denylist_match": denied_by,
-                    "require_allowlist": cfg.require_allowlist,
-                    "allowlist_prefixes": cfg.allowlist_prefixes,
-                    "instruction": "Provide a safer alternative command (prefer read-only inspection).",
-                }, ensure_ascii=False)})
-                continue
-
-            # Present to user
-            print(f"\n\n**********\nSTEP {step_cnt}")
-            print(f"\nCommand:\n{cmd}\n")
-            print(f"Explanation: {step.get('explanation', '')}")
-            print(f"Expected outcome: {step.get('expected_outcome', '')}")
-            print(f"Risk: {step.get('risk', 'UNKNOWN')}\n")
-
-            # --- replace the old action handling block with this ---
-
-            skip_level = False
-            final_cmd = ""
-            while True:
-                action, payload = prompt_action(step.get("confirmation_prompt", "Run this command?"))
-
-                if action == "ask":
-                    interjection_qa(client, cfg, shell_name, cmd)
-                    # IMPORTANT: do NOT attempt to interpret payload; just loop and prompt again.
-                    continue
-
-                if action == "skip":
-                    messages.append({"role": "user", "content": json.dumps({
-                        "type": "user_skipped",
-                        "skipped_command": cmd,
-                        "reason": "user_selected_skip",
-                    }, ensure_ascii=False)})
-                    # skip this command and request next model step
-                    skip_level = 1
-                    break
-
-                if action == "instruct":
-                    supplement = (payload or "").strip()
-                    messages.append({"role": "user", "content": json.dumps(
-                        build_supplement_payload(cmd, supplement),
-                        ensure_ascii=False
-                    )})
-                    # skip this command and request next model step (with supplement)
-                    skip_level = 1
-                    break
-
-                if action == "run":
-                    final_cmd = cmd
-                    skip_level = 0
-                    break
-
-                if action == "edit":
-                    final_cmd = (payload or cmd)
-                    skip_level = 0
-                    break
-
-                if action == "quit":
-                    skip_level = 2
-                    break
-
-            # After the loop:
-            if skip_level == 2:
-                break
-            if skip_level == 1:
-                continue
-
-            # Run
-            exec_result = run_command(
-                shell_name=shell_name,
-                shell_prefix=shell_prefix,
-                command=final_cmd,
-                timeout_seconds=cfg.timeout_seconds,
-                max_output_chars=cfg.max_output_chars,
-                workdir=cfg.workdir,
-                extra_env=cfg.env,
-            )
-
-            # Show result to console
-            preview_limit = cfg.exec_preview_chars
-
-            stdout_text = clip_text(format_shell_text(exec_result.get("stdout", "") or ""), preview_limit)
-            stderr_text = clip_text(format_shell_text(exec_result.get("stderr", "") or ""), preview_limit)
-
-            print("\n[EXEC RESULT]")
-            print(f"shell: {exec_result.get('shell')}")
-            print(f"cwd: {exec_result.get('cwd')}")
-            print(f"exit_code: {exec_result.get('exit_code')}")
-            print(f"timed_out: {exec_result.get('timed_out')}")
-            print(f"elapsed_seconds: {exec_result.get('elapsed_seconds')}")
-
-            print("\n[STDOUT]")
-            if stdout_text:
-                print(stdout_text, end="" if stdout_text.endswith("\n") else "\n")
-            else:
-                print("(empty)")
-
-            if stderr_text:
-                print("\n[STDERR]")
-                print(stderr_text, end="" if stderr_text.endswith("\n") else "\n")
-
-            # Send feedback to model
-            messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
-            messages.append(
-                {"role": "user", "content": json.dumps(build_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
 
     return 0
 
