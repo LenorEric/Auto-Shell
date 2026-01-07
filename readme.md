@@ -24,6 +24,30 @@ This program is specialized for the ChatGPT API and tested based on ChatGPT 5.2;
 
 ## Frequently Asked Questions
 
+## 1. Garbled Characters
+
 Q: Garbled characters in the console output, especially when the system uses other encodings in Windows.
 
 A: Run `chcp 65001` before call the script
+
+## 2. Using proxy
+
+Q: I want to use proxy to connect to the API server
+
+A: Export the proxy in the environment variables. 
+
+For windows cmd shell, for example:
+
+```bash
+set http_proxy=http://127.0.0.1:7890
+set https_proxy=http://127.0.0.1:7890
+python auto_shell.py config.yml
+```
+
+For linux bash:
+
+```bash
+export https_proxy=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 all_proxy=socks5://127.0.0.1:7890
+python auto_shell.py config.yml
+```
+
