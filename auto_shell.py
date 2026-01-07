@@ -29,6 +29,7 @@ class AppConfig:
     api_key: str
     base_url: Optional[str]
     model: str
+    selected_model: str
     reasoning_effort: str
     timeout_seconds: int
     max_output_chars: int
@@ -51,7 +52,8 @@ def load_config(path: str) -> AppConfig:
     return AppConfig(
         api_key=api_key,
         base_url=openai_cfg.get("base_url"),
-        model=openai_cfg.get("model", "gpt-5-chat-latest"),
+        model=openai_cfg.get("model", "auto"),
+        selected_model=openai_cfg.get("model", "auto"),
         reasoning_effort=openai_cfg.get("reasoning_effort", "low"),
         timeout_seconds=int(agent_cfg.get("timeout_seconds", 30)),
         max_output_chars=int(agent_cfg.get("max_output_chars", 8192)),
@@ -235,7 +237,8 @@ def parse_step_json(raw_text: str) -> Dict[str, Any]:
             fixed_text = extract_first_json(raw_text)
             if fixed_text:
                 loaded = json.loads(fixed_text)
-                print("[WARN] Error occurred when parsing model output as JSON, but successfully extracted JSON portion.")
+                print(
+                    "[WARN] Error occurred when parsing model output as JSON, but successfully extracted JSON portion.")
                 return loaded
         except Exception:
             print("[ERROR] Failed to parse model output as JSON. Raw output:")
@@ -377,7 +380,7 @@ def interjection_qa(
 
         temp_messages.append({"role": "user", "content": q})
         resp = client.responses.create(
-            model=cfg.model,
+            model=cfg.selected_model,
             # reasoning=eval_reasoning_effort(cfg.reasoning_effort),
             input=temp_messages,
         )
@@ -394,7 +397,7 @@ def call_model(
 ) -> Dict[str, Any]:
     while True:
         resp = client.responses.create(
-            model=cfg.model,
+            model=cfg.selected_model,
             # reasoning=eval_reasoning_effort(cfg.reasoning_effort),
             input=messages,
             text={"format": {"type": "json_schema", "name": json_schema["name"], "strict": True,
@@ -472,11 +475,13 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
 def dump_history(
         messages: Union[list, dict],
         step_cnt: int,
+        selected_model: str,
         path: Union[str, Path] = "history.json"
 ) -> None:
     data = {
         "messages": messages,
         "step_cnt": int(step_cnt),
+        "selected_model": selected_model
     }
 
     path = Path(path)
@@ -486,15 +491,16 @@ def dump_history(
 
 def load_history(
         path: Union[str, Path] = "history.json"
-) -> tuple[Union[list, dict], int]:
+) -> tuple[Union[list, dict], int, str]:
     path = Path(path)
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     messages = data.get("messages")
     step_cnt = int(data.get("step_cnt", 0))
+    selected_model = data.get("selected_model", "gpt-5-chat-latest")
 
-    return messages, step_cnt
+    return messages, step_cnt, selected_model
 
 
 import json
@@ -595,6 +601,87 @@ def replay_console_history(messages: List[Dict[str, str]]) -> None:
                 print(payload.get("user_rejected"))
                 if payload.get("reason"):
                     print(f"Reason: {payload.get('reason')}")
+
+
+def auto_select_model(client: OpenAI, goal: str) -> str:
+    router_model = "gpt-4.1-mini"
+
+    model_map = {
+        "large": "gpt-5-chat-latest",
+        "medium": "gpt-4.1-mini",
+        "small": "gpt-4.1-nano",
+    }
+
+    system_prompt = """
+        You are a task complexity evaluator for a computer automation agent engine.
+
+        Given a user's goal, classify the task complexity into exactly one of:
+        - "small": very explicit, short, deterministic operations; minimal steps; low risk.
+        - "medium": clear intent with multiple steps or rules; some branching; moderate length.
+        - "large": ambiguous, diagnostic, open-ended, or long-running tasks; requires troubleshooting, system understanding, or architectural decisions.
+
+        Rules:
+        1. If the complexity is uncertain, choose the larger.
+        2. Do not solve the task.
+        3. Base your decision on ambiguity, number of steps, need for diagnosis, and risk.
+        4. Output must be valid JSON only.
+        """.strip()
+
+    text_schema = {
+        "format": {
+            "type": "json_schema",
+            "name": "task_complexity_evaluator",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "complexity": {
+                        "type": "string",
+                        "enum": ["small", "medium", "large"],
+                        "description": "Evaluated task complexity level"
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Confidence score of the evaluation"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief technical justification for the selected complexity"
+                    }
+                },
+                "required": ["complexity", "confidence", "reason"]
+            }
+        }
+    }
+
+    response = client.responses.create(
+        model=router_model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": goal},
+        ],
+        text=text_schema
+    )
+
+    # 提取文本输出
+    output_text = response.output_text.strip()
+
+    try:
+        result = json.loads(output_text)
+        complexity = result.get("complexity")
+    except json.JSONDecodeError as e:
+        print(output_text)
+        print("[WARN] Router output parse failed; escalated to large model.", e)
+        complexity = "large"
+
+    if complexity not in model_map:
+        print("[WARN] Router output parse failed; escalated to large model.")
+        complexity = "large"
+
+    return model_map[complexity]
 
 
 def main() -> int:
@@ -859,7 +946,7 @@ def main() -> int:
         # Present query to user
         print(f"\nQuery:\n{qry}\n")
 
-        dump_history(messages, step_cnt)
+        dump_history(messages, step_cnt, cfg.selected_model)
 
         answer = input("ANS> ")
 
@@ -909,12 +996,13 @@ def main() -> int:
     hist_path = Path("history.json")
     messages = None
     step_cnt = 0
+    cfg.selected_model = "gpt-5-chat-latest"
     use_hist = False
     if hist_path.exists():
         use_hist = True if input("Found existing history.json. Load it? [y/n]: ").strip().lower() == "y" else False
         if use_hist:
             try:
-                messages, step_cnt = load_history(hist_path)
+                messages, step_cnt, cfg.selected_model = load_history(hist_path)
                 print(f"Loaded history from `history.json` (step_cnt={step_cnt}).")
             except Exception as e:
                 print(f"Failed to load history from `history.json`: {e}")
@@ -930,6 +1018,11 @@ def main() -> int:
                 break
 
             step_cnt = 0
+            if cfg.model.lower() == "auto":
+                cfg.selected_model = auto_select_model(client, goal)
+                print(f"\nUsing auto-selected model: {cfg.selected_model}\n")
+            else:
+                cfg.selected_model = cfg.model
 
             # Conversation for this goal
             messages = [

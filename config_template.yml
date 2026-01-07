@@ -3,8 +3,8 @@ openai:
   api_key: "YOUR_API_KEY"
   # Default OpenAI endpoint:
   base_url: "https://api.openai.com/v1"
-  # Requested model:
-  model: "gpt-5-chat-latest"
+  # Requested model (ChatGPT version or auto):
+  model: "auto"
   # Reasoning effort (commonly: none/minimal/low/medium/high/xhigh depending on model support)
   # reasoning_effort: "medium"
 
