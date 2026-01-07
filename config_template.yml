@@ -6,7 +6,7 @@ openai:
   # Requested model:
   model: "gpt-5-chat-latest"
   # Reasoning effort (commonly: low/medium/high/xhigh depending on model support)
-  reasoning_effort: "low"
+  reasoning_effort: "medium"
 
 agent:
   timeout_seconds: 30
