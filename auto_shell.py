@@ -169,7 +169,7 @@ def build_json_schema() -> Dict[str, Any]:
             "additionalProperties": False,
             "properties": {
                 "cmd_type": {"type": "string", "enum": ["done", "python", "shell", "query"],
-                             "description": "Current step type. If all works are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
+                             "description": "Current step type. If all works (including user's appending goals in supplement) are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
                 "operation": {"type": ["string", "null"],
                               "description": "Exactly one shell command (multiple commands shall be joined with proper connector if necessary to save steps) to be directly run if type=shell, or python code snippet to be executed if type=python, or question that needs ensure from the user if type=query, or null if done=true."},
                 "explanation": {"type": "string",
@@ -262,10 +262,10 @@ Hard rules:
 - Python code SHALL use standard libraries, or confirm the libraries are pre-installed before used.
 - Prefer safe, read-only inspection commands.
 - If a "shell" or "python" step is risky (deletes data, changes settings, modifies registry and so on), set risk="high" and suggest an alternative in the conclusion_prompt. Risk level refers only to the current command.
-- You may receive a JSON "supplement" when the user adds constraints. Treat it as a high-priority update and adapt the next step.
+- You may receive a JSON "supplement" when the user adds constraints. Treat it as a high-priority update to the goal in the beginning and adapt the next step. It will be the new goal if it changed the old goal or give additional requests.
 - If the user rejects a command, do not insist on repeating it; adapt and try another way.
 - If reboot (or leave) is needed, ask the user via a "query" step, don't directly reboot.
-- If the task is complete, set cmd_type="done", operation=null, and provide done_summary.
+- If the task (including all user's appending goals and requests in supplement) is complete (if really not sure, prefer asking the user), set cmd_type="done", operation=null, and provide done_summary.
 
 Interaction:
 - You will receive JSON feedback about the last command's stdout/stderr/exit_code (or python execution results) or user's answer.
