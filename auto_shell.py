@@ -215,7 +215,7 @@ You are SmartShell, an assistant that completes a user's goal by proposing ONE a
 Hard rules:
 - Output MUST be valid JSON matching the provided schema (no markdown, no extra keys).
 - Propose EXACTLY ONE action per step by setting cmd_type to "shell", "python", "query", or "done".
-- If the goal is vague or requires clarification/choice, set cmd_type="query" and put your question in the "operation" field. Set fields like risk, explanation, and expected_outcome to null.
+- If the goal is vague or ambiguous (no need to double-check the clearly stated goal even if it's dangerous), set cmd_type="query" and put your question in the "operation" field. Set risk=null, explanation=null, expected_outcome=null.
 - Shell commands MUST target the user's shell: "{shell_name}" only.
 - Shell should be used first, but if a Python script is more suitable, set cmd_type="python" and provide a concise and efficient Python code. (no comments needed in the script).
 - The Python code MUST be compatible with Python version {platform.python_version()}.
@@ -397,7 +397,7 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
     - instruct: optional_text = supplementary instruction
     """
     print(prompt)
-    print("Choose: [y]es(run) / [e]dit+run / [s]kip / [a]sk / [i]nstruct / [q]uit")
+    print("Choose: [y]es(run) / [s]kip / [a]sk / [i]nstruct / [q]uit")
     while True:
         choice = input("> ").strip().lower()
 
@@ -417,7 +417,11 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
 
         if choice in ("i", "instruct"):
             supp = input("Supplementary instruction for the model:\n> ")
-            return "instruct", supp
+            if not supp.strip():
+                print("Supplement cannot be empty.")
+                continue
+            else:
+                return "instruct", supp
 
         if choice in ("q", "quit", "exit"):
             return "quit", None
@@ -501,7 +505,7 @@ def main() -> int:
                     "elapsed_seconds": round(elapsed, 3),
                 }
 
-        cmd = step.get("command") or ""
+        cmd = step.get("operation") or "No valid cmd got from llm"
 
         # Safety checks
         denied_by = is_denied(cmd, cfg.denylist_regex)
@@ -648,7 +652,7 @@ def main() -> int:
                     },
                 }
 
-        pyc = step.get("operation") or ""
+        pyc = step.get("operation") or "No valid python code got from llm"
 
         # Present to user
         print(f"\nCommand:\n{pyc}\n")
@@ -657,7 +661,6 @@ def main() -> int:
         print(f"Risk: {step.get('risk', 'UNKNOWN')}\n")
 
         _skip_lvl = 0
-        final_cmd = ""
         while True:
             action, payload = prompt_action(step.get("conclusion_prompt", "Run this command?"))
             if action == "ask":
@@ -679,6 +682,9 @@ def main() -> int:
                 )})
                 _skip_lvl = 1
                 break
+            if action == "edit":
+                print("Editing Python code is not supported currently.")
+                continue
             if action == "run":
                 _skip_lvl = 0
                 break
@@ -700,7 +706,7 @@ def main() -> int:
         return 0
 
     def serve_query_cmd():
-        qry = step.get("operation") or ""
+        qry = step.get("operation") or "No valid query got from llm"
 
         # Present query to user
         print(f"\nQuery:\n{qry}\n")
