@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -69,10 +70,6 @@ def load_config(path: str) -> AppConfig:
     )
 
 
-def dump_list_dict_str(data: list[dict[str, str]]) -> str:
-    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
-
 # -----------------------------
 # Shell execution
 # -----------------------------
@@ -84,60 +81,6 @@ def detect_shell() -> Tuple[str, List[str]]:
         return ("powershell", ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
     # bash (Linux/macOS)
     return ("bash", ["bash", "-lc"])
-
-
-def run_command(
-        shell_name: str,
-        shell_prefix: List[str],
-        command: str,
-        timeout_seconds: int,
-        max_output_chars: int,
-        workdir: Optional[str],
-        extra_env: Dict[str, str],
-) -> Dict[str, Any]:
-    cwd = workdir or os.getcwd()
-    env = os.environ.copy()
-    env.update(extra_env)
-
-    start = time.time()
-    try:
-        proc = subprocess.run(
-            shell_prefix + [command],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-        )
-        elapsed = time.time() - start
-        stdout = (proc.stdout or "")[:max_output_chars]
-        stderr = (proc.stderr or "")[:max_output_chars]
-        return {
-            "shell": shell_name,
-            "command": command,
-            "cwd": cwd,
-            "exit_code": proc.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timed_out": False,
-            "elapsed_seconds": round(elapsed, 3),
-        }
-    except subprocess.TimeoutExpired as e:
-        elapsed = time.time() - start
-        stdout = (e.stdout or "")[:max_output_chars] if isinstance(e.stdout, str) else ""
-        stderr = (e.stderr or "")[:max_output_chars] if isinstance(e.stderr, str) else ""
-        return {
-            "shell": shell_name,
-            "command": command,
-            "cwd": cwd,
-            "exit_code": None,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timed_out": True,
-            "elapsed_seconds": round(elapsed, 3),
-        }
 
 
 _RE_NBSP = re.compile(r"[\u00A0\u2007\u202F]")  # common non-breaking spaces
@@ -231,22 +174,21 @@ def build_json_schema() -> Dict[str, Any]:
             "additionalProperties": False,
             "properties": {
                 "cmd_type": {"type": "string", "enum": ["done", "python", "shell", "query"],
-                         "description": "Current step type. If all works are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
-                "command": {"type": ["string", "null"],
-                            "description": "Exactly one shell command to be directly run if type=shell, or question that needs ensure from the user if type=query, or null if done=true. Multiple commands shall be joined with proper connector if necessary to save steps."},
-                "python_code" : {"type": ["string", "null"],
-                                    "description": "Python code snippet to be executed if type=python, or null otherwise."},
+                             "description": "Current step type. If all works are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
+                "operation": {"type": ["string", "null"],
+                              "description": "Exactly one shell command (multiple commands shall be joined with proper connector if necessary to save steps) to be directly run if type=shell, or python code snippet to be executed if type=python, or question that needs ensure from the user if type=query, or null if done=true."},
                 "explanation": {"type": "string",
                                 "description": "Analyze this command and its parameters from a technical perspective, and briefly explain its function. Or null if type=query"},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
                          "description": "Risk level of current command to be run(just focus on the current one, not the global intention). Or null if type=query"},
                 "conclusion_prompt": {"type": "string",
-                                        "description": "Before the user decides whether to execute it, explain to the user the overall effect of this command and the reason for doing so.  Or null if type=query"},
-                "expected_outcome": {"type": "string", "description": "What success console output looks like for this step's command. Or null if type=query"},
+                                      "description": "Before the user decides whether to execute it, explain to the user the overall effect of this command and the reason for doing so.  Or null if type=query"},
+                "expected_outcome": {"type": "string",
+                                     "description": "What success console output looks like for this step's command. Or null if type=query"},
                 "done_summary": {"type": ["string", "null"],
                                  "description": "If done=true, summarize what was accomplished or give final answer."},
             },
-            "required": ["cmd_type", "command", "python_code", "explanation", "risk", "conclusion_prompt", "expected_outcome",
+            "required": ["cmd_type", "operation", "explanation", "risk", "conclusion_prompt", "expected_outcome",
                          "done_summary"],
         },
     }
@@ -273,14 +215,18 @@ You are SmartShell, an assistant that completes a user's goal by proposing ONE a
 Hard rules:
 - Output MUST be valid JSON matching the provided schema (no markdown, no extra keys).
 - Propose EXACTLY ONE action per step by setting cmd_type to "shell", "python", "query", or "done".
-- If the goal is vague or requires clarification/choice, set cmd_type="query" and put your question in the "command" field. Set fields like risk, explanation, and expected_outcome to null.
-- If a Python script is more suitable than shell commands, set cmd_type="python" and provide the code in "python_code" (no comments needed in the script).
+- If the goal is vague or requires clarification/choice, set cmd_type="query" and put your question in the "operation" field. Set fields like risk, explanation, and expected_outcome to null.
 - Shell commands MUST target the user's shell: "{shell_name}" only.
+- Shell should be used first, but if a Python script is more suitable, set cmd_type="python" and provide a concise and efficient Python code. (no comments needed in the script).
+- The Python code MUST be compatible with Python version {platform.python_version()}.
+- Python code MUST include a `handle()` function as its entry point. At runtime, only this function will be executed as the entry point. The return value of this function will feedback to you.
+- Python code MUST NOT containing console input calls (e.g., input()), and try to avoid output as possible.
+- Python code SHALL use standard libraries, or confirm the libraries are pre-installed before used.
 - Prefer safe, read-only inspection commands.
 - If a "shell" or "python" step is risky (deletes data, changes settings, modifies registry and so on), set risk="high" and suggest an alternative in the conclusion_prompt. Risk level refers only to the current command.
 - You may receive a JSON "supplement" when the user adds constraints. Treat it as a high-priority update and adapt the next step.
 - If the user rejects a command, do not insist on repeating it; adapt and try another way.
-- If the task is complete, set cmd_type="done", command=null, and provide done_summary.
+- If the task is complete, set cmd_type="done", operation=null, and provide done_summary.
 
 Interaction:
 - You will receive JSON feedback about the last command's stdout/stderr/exit_code (or python execution results) or user's answer.
@@ -292,13 +238,13 @@ Keep explanations brief.
 
 def build_interjection_system_instructions(shell_name: str) -> str:
     return f"""
-You are a command explainer for a user reviewing a proposed shell command.
+You are a command explainer for a user reviewing a proposed shell command from smart shell assistant.
 
 Context:
-- Shell: {shell_name}
-- The user will ask questions about the command’s meaning, risks, and what it changes.
-- Do NOT propose alternative commands.
-- Do NOT suggest multi-step plans.
+- Shell: {shell_name} / Python Version: {platform.python_version()}
+- The history context between user and smart shell assistant is given below, after that, it's the user's question.
+- The user will ask questions about the given command.
+- Do NOT propose alternative commands or plans.
 - Keep answers short, concrete, and focused on safety and effect.
 - Output in simple PLAIN text without markdown format because the interaction occurs in the terminal console.
 - If the command is dangerous or ambiguous, clearly state why and what to verify before running.
@@ -310,11 +256,12 @@ def build_user_payload(goal: str, shell_name: str) -> Dict[str, Any]:
         "type": "goal",
         "goal": goal,
         "shell": shell_name,
+        "python_version": platform.python_version(),
         "timestamp": int(time.time()),
     }
 
 
-def build_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> Dict[str, Any]:
+def build_cmd_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> Dict[str, Any]:
     if compress:
         exec_result["stdout"] = compress_for_llm(exec_result.get("stdout", ""))
         exec_result["stderr"] = compress_for_llm(exec_result.get("stderr", ""))
@@ -322,6 +269,13 @@ def build_feedback_payload(exec_result: Dict[str, Any], compress: bool) -> Dict[
         "type": "command_result",
         "result": exec_result,
         "timestamp": int(time.time()),
+    }
+
+
+def build_query_feedback_payload(answer: str) -> Dict[str, Any]:
+    return {
+        "type": "query_answer",
+        "answer": answer,
     }
 
 
@@ -357,6 +311,7 @@ def interjection_qa(
         cfg: AppConfig,
         shell_name: str,
         command: str,
+        context: List[Dict[str, str]],
 ) -> None:
     """
     Inline Q&A about a proposed command.
@@ -364,6 +319,19 @@ def interjection_qa(
     End by entering a single '.' (dot) on its own line.
     """
     print("\nASK MODE (end with a single '.' line)")
+
+    context_messages = context[1:]
+
+    temp_messages = [
+        {"role": "system", "content": build_interjection_system_instructions(shell_name)},
+        *context_messages,
+        {"role": "user",
+         "content": "The above is the historical operation record; the following are the user's questions."},
+        {"role": "user",
+         "content": json.dumps({"type": "proposed_command", "command": command},
+                               ensure_ascii=False)}
+    ]
+
     while True:
         q = input("ASK> ").strip()
         if q == ".":
@@ -372,20 +340,13 @@ def interjection_qa(
         if not q:
             continue
 
-        temp_messages = [
-            {"role": "system", "content": build_interjection_system_instructions(shell_name)},
-            {"role": "user",
-             "content": json.dumps({"type": "proposed_command", "shell": shell_name, "command": command},
-                                   ensure_ascii=False)},
-            {"role": "user", "content": q},
-        ]
-
-        # Plain text reply is best here (no schema).
+        temp_messages.append({"role": "user", "content": q})
         resp = client.responses.create(
             model=cfg.model,
             reasoning=eval_reasoning_effort(cfg.reasoning_effort),
-            input=dump_list_dict_str(temp_messages),
+            input=temp_messages,
         )
+        temp_messages.append({"role": "assistant", "content": extract_output_text(resp)})
         answer = extract_output_text(resp).strip()
         print(answer + "\n")
 
@@ -400,7 +361,7 @@ def call_model(
     resp = client.responses.create(
         model=cfg.model,
         reasoning=eval_reasoning_effort(cfg.reasoning_effort),
-        input=dump_list_dict_str(messages),
+        input=messages,
         text={"format": {"type": "json_schema", "name": json_schema["name"], "strict": True,
                          "schema": json_schema["schema"], }},
     )
@@ -464,8 +425,6 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
         print("Invalid input. Use y/e/s/a/i.")
 
 
-
-
 def main() -> int:
     def is_admin() -> bool:
         if os.name == "nt":  # Windows
@@ -493,6 +452,55 @@ def main() -> int:
         return s[:end_idx] + "\n...[truncated]"
 
     def serve_shell_cmd():
+        def run_shell_command(
+                shell_prefix: List[str],
+                command: str,
+                timeout_seconds: int,
+                max_output_chars: int,
+                workdir: Optional[str],
+                extra_env: Dict[str, str],
+        ) -> Dict[str, Any]:
+            cwd = workdir or os.getcwd()
+            env = os.environ.copy()
+            env.update(extra_env)
+
+            start = time.time()
+            try:
+                proc = subprocess.run(
+                    shell_prefix + [command],
+                    cwd=cwd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout_seconds,
+                )
+                elapsed = time.time() - start
+                stdout = (proc.stdout or "")[:max_output_chars]
+                stderr = (proc.stderr or "")[:max_output_chars]
+                return {
+                    "cwd": cwd,
+                    "actual_run_cmd": final_cmd,
+                    "exit_code": proc.returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "timed_out": False,
+                    "elapsed_seconds": round(elapsed, 3),
+                }
+            except subprocess.TimeoutExpired as e:
+                elapsed = time.time() - start
+                stdout = (e.stdout or "")[:max_output_chars] if isinstance(e.stdout, str) else ""
+                stderr = (e.stderr or "")[:max_output_chars] if isinstance(e.stderr, str) else ""
+                return {
+                    "cwd": cwd,
+                    "actual_run_cmd": final_cmd,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "timed_out": True,
+                    "elapsed_seconds": round(elapsed, 3),
+                }
+
         cmd = step.get("command") or ""
 
         # Safety checks
@@ -523,16 +531,13 @@ def main() -> int:
         print(f"Expected outcome: {step.get('expected_outcome', '')}")
         print(f"Risk: {step.get('risk', 'UNKNOWN')}\n")
 
-        # --- replace the old action handling block with this ---
-
         _skip_lvl = 0
         final_cmd = ""
         while True:
             action, payload = prompt_action(step.get("conclusion_prompt", "Run this command?"))
 
             if action == "ask":
-                interjection_qa(client, cfg, shell_name, cmd)
-                # IMPORTANT: do NOT attempt to interpret payload; just loop and prompt again.
+                interjection_qa(client, cfg, shell_name, cmd, messages)
                 continue
 
             if action == "reject":
@@ -551,7 +556,6 @@ def main() -> int:
                     build_supplement_payload(cmd, supplement),
                     ensure_ascii=False
                 )})
-                # skip this command and request next model step (with supplement)
                 _skip_lvl = 1
                 break
 
@@ -574,8 +578,7 @@ def main() -> int:
             return _skip_lvl
 
         # Run
-        exec_result = run_command(
-            shell_name=shell_name,
+        exec_result = run_shell_command(
             shell_prefix=shell_prefix,
             command=final_cmd,
             timeout_seconds=cfg.timeout_seconds,
@@ -610,19 +613,119 @@ def main() -> int:
         messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
         messages.append(
             {"role": "user",
-             "content": json.dumps(build_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
+             "content": json.dumps(build_cmd_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
 
         return 0
 
     def serve_python_cmd():
+        def run_agent_code(code_str) -> Dict[str, Any]:
+            try:
+                if not isinstance(code_str, str):
+                    raise TypeError(f"get_code() must return str, got {type(code_str).__name__}")
+
+                exec_env = {"__builtins__": __builtins__}
+
+                # Compile first so syntax errors are caught cleanly with traceback
+                compiled = compile(code_str, "<agent_code>", "exec")
+                exec(compiled, exec_env, exec_env)
+
+                handle_func = exec_env.get("handle")
+                if handle_func is None or not callable(handle_func):
+                    raise RuntimeError("handle() function not found or not callable")
+
+                result = handle_func()
+
+                return {"ok": True, "result": result, "error": None}
+
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "result": None,
+                    "error": {
+                        "type": type(e).__name__,
+                        "message": str(e),
+                        "traceback": traceback.format_exc(),
+                    },
+                }
+
+        pyc = step.get("operation") or ""
+
+        # Present to user
+        print(f"\nCommand:\n{pyc}\n")
+        print(f"Explanation: {step.get('explanation', '')}")
+        print(f"Expected outcome: {step.get('expected_outcome', '')}")
+        print(f"Risk: {step.get('risk', 'UNKNOWN')}\n")
+
+        _skip_lvl = 0
+        final_cmd = ""
+        while True:
+            action, payload = prompt_action(step.get("conclusion_prompt", "Run this command?"))
+            if action == "ask":
+                interjection_qa(client, cfg, shell_name, pyc, messages)
+                continue
+            if action == "reject":
+                messages.append({"role": "user", "content": json.dumps({
+                    "type": "user_rejected",
+                    "user_rejected": pyc,
+                    "reason": payload or "user rejected without reason",
+                }, ensure_ascii=False)})
+                _skip_lvl = 1
+                break
+            if action == "instruct":
+                supplement = (payload or "").strip()
+                messages.append({"role": "user", "content": json.dumps(
+                    build_supplement_payload(pyc, supplement),
+                    ensure_ascii=False
+                )})
+                _skip_lvl = 1
+                break
+            if action == "run":
+                _skip_lvl = 0
+                break
+            if action == "quit":
+                _skip_lvl = 2
+                break
+
+        # After the loop:
+        if _skip_lvl:
+            return _skip_lvl
+
+        exec_result = run_agent_code(pyc)
+
+        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
+        messages.append(
+            {"role": "user",
+             "content": json.dumps(build_cmd_feedback_payload(exec_result, cfg.compress_for_llm), ensure_ascii=False)})
+
         return 0
 
     def serve_query_cmd():
+        qry = step.get("operation") or ""
+
+        # Present query to user
+        print(f"\nQuery:\n{qry}\n")
+
+        _skip_lvl = 0
+        answer = input("ANS> ")
+
+        # Send feedback to model
+        messages.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
+        messages.append(
+            {"role": "user",
+             "content": json.dumps(build_query_feedback_payload(answer), ensure_ascii=False)})
+
         return 0
 
     if len(sys.argv) < 2:
         print("Usage: python smart_shell_agent.py path/to/config.yml")
         return 2
+
+    shell_name, shell_prefix = detect_shell()
+    if not (is_admin()):
+        print("WARNING: The agent is NOT running with administrative/root privileges.")
+        print("Some commands may fail due to insufficient permissions. You may want to elevate your privileges.\n")
+    print(f"Shell detected: {shell_name}")
+    print(f"Python version: {platform.python_version()}")
 
     cfg = load_config(sys.argv[1])
 
@@ -631,13 +734,8 @@ def main() -> int:
         client_kwargs["base_url"] = cfg.base_url
     client = OpenAI(**client_kwargs)  # SDK quickstart. :contentReference[oaicite:5]{index=5}
 
-    shell_name, shell_prefix = detect_shell()
     schema = build_json_schema()
 
-    if not (is_admin()):
-        print("WARNING: The agent is NOT running with administrative/root privileges.")
-        print("Some commands may fail due to insufficient permissions. You may want to elevate your privileges.\n")
-    print(f"Shell detected: {shell_name}")
     print("Enter a goal (empty line to exit).")
 
     while True:
@@ -666,9 +764,10 @@ def main() -> int:
 
             # Done?
             if step.get("cmd_type") == "done":
-                print("\nDONE")
                 if step.get("done_summary"):
+                    print()
                     print(step["done_summary"])
+                print("DONE\n**********\n")
                 skip_lvl = 2
             elif step.get("cmd_type") == "shell":
                 skip_lvl = serve_shell_cmd()
@@ -679,7 +778,6 @@ def main() -> int:
 
             if skip_lvl == 2:
                 break
-
 
     return 0
 

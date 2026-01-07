@@ -16,6 +16,12 @@ The console will first output the command to be executed, the command analysis, 
 
 After that, the user can choose to execute the command `[y]`, edit the command`[e]`, reject the current command`[r]`, ask questions about the current command`[a]`, or skip the current command and provide additional requirements to generate a new command`[i]`, quit current conversation`[q]`.
 
+
+
+Asking Question in English is recommended since the prompt is based on English.
+
+This program is specialized for the ChatGPT API and tested based on ChatGPT 5.2; using other APIs may result in compatibility issues.
+
 ## Frequently Asked Questions
 
 Q: Garbled characters in the console output, especially when the system uses other encodings in Windows.
