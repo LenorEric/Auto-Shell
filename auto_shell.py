@@ -386,12 +386,30 @@ def prompt_action(prompt: str) -> Tuple[str, Optional[str]]:
 
 
 def main() -> int:
-    def _clip_text(s: str, limit: int) -> str:
-        if s is None:
+    def is_admin() -> bool:
+        if os.name == "nt":  # Windows
+            try:
+                import ctypes
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
+        else:  # Linux / macOS / Unix
+            return os.geteuid() == 0
+
+    def clip_text(s: str, limit: int) -> str:
+        if not s:
             return ""
-        if len(s) <= limit:
+        count = 0
+        end_idx = 0
+        for i, ch in enumerate(s):
+            if not ch.isspace():
+                count += 1
+            if count > limit:
+                break
+            end_idx = i + 1
+        if count <= limit:
             return s
-        return s[:limit] + "\n...[truncated]"
+        return s[:end_idx] + "\n...[truncated]"
 
     if len(sys.argv) < 2:
         print("Usage: python smart_shell_agent.py path/to/config.yml")
@@ -407,6 +425,9 @@ def main() -> int:
     shell_name, shell_prefix = detect_shell()
     schema = build_json_schema()
 
+    if not(is_admin()):
+        print("WARNING: The agent is NOT running with administrative/root privileges.")
+        print("Some commands may fail due to insufficient permissions. You may want to elevate your privileges.\n")
     print(f"Shell detected: {shell_name}")
     print("Enter a goal (empty line to exit).")
 
@@ -547,10 +568,10 @@ def main() -> int:
             )
 
             # Show result to console
-            preview_limit = getattr(cfg, "exec_preview_chars", 512)
+            preview_limit = cfg.exec_preview_chars
 
-            stdout_text = _clip_text(format_shell_text(exec_result.get("stdout", "") or ""), preview_limit)
-            stderr_text = _clip_text(format_shell_text(exec_result.get("stderr", "") or ""), preview_limit)
+            stdout_text = clip_text(format_shell_text(exec_result.get("stdout", "") or ""), preview_limit)
+            stderr_text = clip_text(format_shell_text(exec_result.get("stderr", "") or ""), preview_limit)
 
             print("\n[EXEC RESULT]")
             print(f"shell: {exec_result.get('shell')}")
