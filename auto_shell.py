@@ -159,8 +159,8 @@ def is_allowed_by_prefix(command: str, allowlist_prefixes: List[str]) -> bool:
 # Model I/O (Structured JSON)
 # -----------------------------
 
-def build_json_schema() -> Dict[str, Any]:
-    # One-command-per-step contract.
+def build_json_schema_base() -> Dict[str, Any]:
+    # One-command-per-step contract template.
     return {
         "name": "smart_shell_step",
         "strict": True,
@@ -168,10 +168,10 @@ def build_json_schema() -> Dict[str, Any]:
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "cmd_type": {"type": "string", "enum": ["done", "python", "shell", "query"],
-                             "description": "Current step type. If all works (including user's appending goals in supplement) are done, set to 'done'. If proposing a shell command, set to 'shell'. If proposing a python code snippet, set to 'python'. If asking for more info in text, set to 'query'."},
+                "cmd_type": {"type": "string", "enum": ["python", "shell", "query"],
+                             "description": "__CMD_TYPE_DESCRIPTION__"},
                 "operation": {"type": ["string", "null"],
-                              "description": "Exactly one shell command (multiple commands shall be joined with proper connector if necessary to save steps) to be directly run if type=shell, or python code snippet to be executed if type=python, or question that needs ensure from the user if type=query, or null if done=true."},
+                              "description": "__OPERATION_DESCRIPTION__"},
                 "explanation": {"type": "string",
                                 "description": "Analyze this command and its parameters from a technical perspective, and briefly explain its function. Or null if type=query"},
                 "risk": {"type": "string", "enum": ["low", "medium", "high"],
@@ -181,12 +181,48 @@ def build_json_schema() -> Dict[str, Any]:
                 "expected_outcome": {"type": "string",
                                      "description": "What success console output looks like for this step's command. Or null if type=query"},
                 "done_summary": {"type": ["string", "null"],
-                                 "description": "If done=true, summarize what was accomplished or give final answer."},
+                                 "description": "__DONE_SUMMARY_DESCRIPTION__"},
             },
             "required": ["cmd_type", "operation", "explanation", "risk", "conclusion_prompt", "expected_outcome",
                          "done_summary"],
         },
     }
+
+
+def build_json_schema(interactive: bool) -> Dict[str, Any]:
+    schema = build_json_schema_base()
+    if interactive:
+        schema["name"] = "smart_shell_step_interactive"
+        schema["schema"]["properties"]["cmd_type"]["enum"] = ["python", "shell", "query"]
+        schema["schema"]["properties"]["cmd_type"]["description"] = (
+            "Current step type. If proposing a shell command, set to 'shell'. "
+            "If proposing a python code snippet, set to 'python'. "
+            "If asking for more info in text, set to 'query'."
+        )
+        schema["schema"]["properties"]["operation"]["description"] = (
+            "Exactly one shell command (multiple commands shall be joined with proper connector if necessary to save "
+            "steps) to be directly run if type=shell, or python code snippet to be executed if type=python, "
+            "or question that needs ensure from the user if type=query."
+        )
+        schema["schema"]["properties"]["done_summary"]["description"] = "Always null in interactive mode."
+    else:
+        schema["name"] = "smart_shell_step"
+        schema["schema"]["properties"]["cmd_type"]["enum"] = ["done", "python", "shell", "query"]
+        schema["schema"]["properties"]["cmd_type"]["description"] = (
+            "Current step type. If all works (including user's appending goals in supplement) are done, "
+            "set to 'done'. If proposing a shell command, set to 'shell'. "
+            "If proposing a python code snippet, set to 'python'. "
+            "If asking for more info in text, set to 'query'."
+        )
+        schema["schema"]["properties"]["operation"]["description"] = (
+            "Exactly one shell command (multiple commands shall be joined with proper connector if necessary to save "
+            "steps) to be directly run if type=shell, or python code snippet to be executed if type=python, "
+            "or question that needs ensure from the user if type=query, or null if done=true."
+        )
+        schema["schema"]["properties"]["done_summary"]["description"] = (
+            "If done=true, summarize what was accomplished or give final answer."
+        )
+    return schema
 
 
 def extract_output_text(resp: Any) -> str:
@@ -246,13 +282,14 @@ def parse_step_json(raw_text: str) -> Dict[str, Any]:
             return {}
 
 
-def build_system_instructions(shell_name: str) -> str:
+def build_system_instructions_base(shell_name: str) -> str:
     return f"""
-You are SmartShell, an assistant that completes a user's goal by proposing ONE action at a time (shell command, python script, or query).
+You are SmartShell__MODE_PHRASE__, an assistant that completes a user's goal by proposing ONE action at a time (shell command, python script, or query).
 
 Hard rules:
 - Output MUST be valid JSON matching the provided schema (no markdown, no extra keys).
-- Propose EXACTLY ONE action per step by setting cmd_type to "shell", "python", "query", or "done".
+- Propose EXACTLY ONE action per step by setting cmd_type to "shell", "python", "query"__DONE_TYPE_RULE__.
+- __DONE_RULE__
 - If the goal is vague or ambiguous (no need to double-check the clearly stated goal even if it's dangerous), or require user external operation (like asking for reboot), set cmd_type="query" and put your question in the "operation" field. Set risk=null, explanation=null, expected_outcome=null.
 - Shell commands MUST target the user's shell: "{shell_name}" only.
 - Shell should be used first, but if a Python script is more suitable, set cmd_type="python" and provide a concise and efficient Python code. (no comments needed in the script).
@@ -265,7 +302,6 @@ Hard rules:
 - You may receive a JSON "supplement" when the user adds constraints. Treat it as a high-priority update to the goal in the beginning and adapt the next step. It will be the new goal if it changed the old goal or give additional requests.
 - If the user rejects a command, do not insist on repeating it; adapt and try another way.
 - If reboot (or leave) is needed, ask the user via a "query" step, don't directly reboot.
-- If the task (including all user's appending goals and requests in supplement) is complete (if really not sure, prefer asking the user), set cmd_type="done", operation=null, and provide done_summary.
 
 Interaction:
 - You will receive JSON feedback about the last command's stdout/stderr/exit_code (or python execution results) or user's answer.
@@ -273,6 +309,21 @@ Interaction:
 
 Keep explanations brief.
 """.strip()
+
+
+def build_system_instructions(shell_name: str, interactive: bool) -> str:
+    base = build_system_instructions_base(shell_name)
+    if interactive:
+        return (
+            base.replace("__MODE_PHRASE__", " in interactive mode")
+            .replace("__DONE_TYPE_RULE__", "")
+            .replace("__DONE_RULE__", "Do NOT use cmd_type=\"done\". The user decides when the goal is achieved and will quit manually.")
+        )
+    return (
+        base.replace("__MODE_PHRASE__", "")
+        .replace("__DONE_TYPE_RULE__", ", or \"done\"")
+        .replace("__DONE_RULE__", "If the task (including all user's appending goals and requests in supplement) is complete (if really not sure, prefer asking the user), set cmd_type=\"done\", operation=null, and provide done_summary.")
+    )
 
 
 def build_interjection_system_instructions(shell_name: str) -> str:
@@ -950,6 +1001,8 @@ def main() -> int:
         dump_history(messages, step_cnt, cfg.selected_model)
 
         answer = input("ANS> ")
+        if answer.strip().lower() in ("q", "quit", "exit"):
+            return 2
 
         messages.append(
             {"role": "user",
@@ -967,6 +1020,8 @@ def main() -> int:
         print(f"\nQuery:\n{qry}\n")
 
         answer = input("ANS> ")
+        if answer.strip().lower() in ("q", "quit", "exit"):
+            raise SystemExit(0)
 
         messages.append(
             {"role": "user",
@@ -991,20 +1046,22 @@ def main() -> int:
         client_kwargs["base_url"] = cfg.base_url
     client = OpenAI(**client_kwargs)  # SDK quickstart. :contentReference[oaicite:5]{index=5}
 
-    schema = build_json_schema()
-
     # If a previous history exists, load it so the agent can resume
     hist_path = Path("history.json")
     messages = None
     step_cnt = 0
     cfg.selected_model = "gpt-5-chat-latest"
     use_hist = False
+    interactive_mode = False
+    schema = build_json_schema(interactive=False)
     if hist_path.exists():
         use_hist = True if input("Found existing history.json. Load it? [y/n]: ").strip().lower() == "y" else False
         if use_hist:
             try:
                 messages, step_cnt, cfg.selected_model = load_history(hist_path)
                 print(f"Loaded history from `history.json` (step_cnt={step_cnt}).")
+                interactive_mode = "interactive mode" in messages[0].get("content", "").lower()
+                schema = build_json_schema(interactive=interactive_mode)
             except Exception as e:
                 print(f"Failed to load history from `history.json`: {e}")
         else:
@@ -1019,6 +1076,14 @@ def main() -> int:
                 break
 
             step_cnt = 0
+            interactive_mode = False
+            if re.match(r"^ia\s+", goal, flags=re.IGNORECASE):
+                interactive_mode = True
+                goal = re.sub(r"^ia\s+", "", goal, flags=re.IGNORECASE).strip()
+                if not goal:
+                    print("Interactive mode prefix detected, but no goal provided.")
+                    continue
+                print("\nInteractive mode enabled. Use [q] to quit when you decide the goal is achieved.\n")
             if cfg.model.lower() == "auto":
                 cfg.selected_model, reason = auto_select_model(client, goal)
                 print(f"\nUsing auto-selected model: {cfg.selected_model}")
@@ -1027,8 +1092,10 @@ def main() -> int:
                 cfg.selected_model = cfg.model
 
             # Conversation for this goal
+            schema = build_json_schema(interactive=interactive_mode)
             messages = [
-                {"role": "system", "content": build_system_instructions(shell_name)},
+                {"role": "system",
+                 "content": build_system_instructions(shell_name, interactive=interactive_mode)},
                 {"role": "user", "content": json.dumps(build_user_payload(goal, shell_name), ensure_ascii=False)},
             ]
 
@@ -1048,7 +1115,13 @@ def main() -> int:
             skip_lvl = 0
 
             # Done?
-            if step.get("cmd_type") == "done":
+            if step.get("cmd_type") == "done" and interactive_mode:
+                step["cmd_type"] = "query"
+                step["operation"] = step.get(
+                    "done_summary") or "The assistant believes the task is complete. Continue or enter 'q' to quit."
+                step["done_summary"] = None
+
+            if step.get("cmd_type") == "done" and not interactive_mode:
                 if step.get("done_summary"):
                     print()
                     print(step["done_summary"])
