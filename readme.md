@@ -11,6 +11,8 @@ python ./auto_shell.py config.yml
 Verified on Python 3.14
 
 When the prompt is `goal`, enter in natural language what you want to do.
+Prefix the goal with `IA ` to enter interactive mode (for example, `IA list recent logs`).
+In interactive mode, the assistant will not end the session; use `[q]` when you decide the goal is achieved.
 
 The console will first output the command to be executed, the command analysis, and the risk level, and will provide the reasons for doing so.
 
@@ -50,4 +52,3 @@ For linux bash:
 export https_proxy=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 all_proxy=socks5://127.0.0.1:7890
 python auto_shell.py config.yml
 ```
-
